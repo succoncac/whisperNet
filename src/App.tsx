@@ -21,7 +21,6 @@ import {
   Smile,
   Volume2,
   VolumeX,
-  EyeOff,
 } from 'lucide-react';
 import {
   getOrCreateMyEcdhIdentity,
@@ -32,6 +31,7 @@ import {
 } from './crypto';
 
 export type ReactionMap = Record<string, string[]>;
+export type MessageDeliveryStatus = 'sending' | 'sent' | 'received';
 
 interface ChatMessage {
   id: string;
@@ -40,6 +40,7 @@ interface ChatMessage {
   content: string;
   timestamp: number;
   reactions?: ReactionMap;
+  deliveryStatus?: MessageDeliveryStatus;
 }
 
 interface RoomMetadata {
@@ -305,9 +306,6 @@ export default function App() {
   // Stale Session / Disconnected Partner State ("Ghost Chat" Prevention)
   const [peerDisconnected, setPeerDisconnected] = useState<boolean>(false);
 
-  // Privacy Screen Blur (Page Visibility API / Window Focus Guard)
-  const [isPrivacyBlurred, setIsPrivacyBlurred] = useState<boolean>(false);
-
   // Web Audio API Sound Notification State
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
     try {
@@ -354,8 +352,8 @@ export default function App() {
   const initialConvsSyncedRef = useRef<boolean>(false);
   const globalEndRef = useRef<HTMLDivElement | null>(null);
   const privateEndRef = useRef<HTMLDivElement | null>(null);
-  const globalInputRef = useRef<HTMLInputElement | null>(null);
-  const privateInputRef = useRef<HTMLInputElement | null>(null);
+  const globalInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const privateInputRef = useRef<HTMLTextAreaElement | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const lastTapRef = useRef<{ msgId: string; time: number }>({ msgId: '', time: 0 });
@@ -435,47 +433,22 @@ export default function App() {
     return () => window.removeEventListener('pointerdown', unlockAudio);
   }, []);
 
-  // Privacy Screen (Page Visibility API & Window Blur Protection) + Idle Activity Tracker
+  // Idle Activity Tracker (15m Inactivity Auto-Wipe Support)
   useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        setIsPrivacyBlurred(true);
-      } else {
-        setIsPrivacyBlurred(false);
-        lastActivityRef.current = Date.now();
-      }
-    };
-
-    const handleWindowBlur = () => {
-      setIsPrivacyBlurred(true);
-    };
-
-    const handleWindowFocus = () => {
-      setIsPrivacyBlurred(false);
-      lastActivityRef.current = Date.now();
-    };
-
     const recordActivity = () => {
       lastActivityRef.current = Date.now();
-      if (document.visibilityState === 'visible') {
-        setIsPrivacyBlurred(false);
-      }
     };
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('blur', handleWindowBlur);
-    window.addEventListener('focus', handleWindowFocus);
-    window.addEventListener('pointerdown', recordActivity, { passive: true });
     window.addEventListener('keydown', recordActivity, { passive: true });
+    window.addEventListener('pointerdown', recordActivity, { passive: true });
     window.addEventListener('touchstart', recordActivity, { passive: true });
+    window.addEventListener('focus', recordActivity, { passive: true });
 
     return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('blur', handleWindowBlur);
-      window.removeEventListener('focus', handleWindowFocus);
-      window.removeEventListener('pointerdown', recordActivity);
       window.removeEventListener('keydown', recordActivity);
+      window.removeEventListener('pointerdown', recordActivity);
       window.removeEventListener('touchstart', recordActivity);
+      window.removeEventListener('focus', recordActivity);
     };
   }, []);
 
@@ -565,6 +538,15 @@ export default function App() {
           if (packet.type === 'p2p:typing' && packet.roomId === activeRoomIdRef.current) {
             setPeerTyping(Boolean(packet.isTyping));
           } else if (
+            packet.type === 'p2p:ack' &&
+            packet.messageId &&
+            packet.roomId === activeRoomIdRef.current
+          ) {
+            const ackId = String(packet.messageId);
+            setPrivateMessages((prev) =>
+              prev.map((m) => (m.id === ackId ? { ...m, deliveryStatus: 'received' } : m))
+            );
+          } else if (
             packet.type === 'p2p:message' &&
             packet.message &&
             packet.roomId === activeRoomIdRef.current
@@ -572,7 +554,11 @@ export default function App() {
             const rawMsg: ChatMessage = packet.message;
             seenMessageIdsRef.current.add(rawMsg.id);
             const plainText = await decryptMessageContent(rawMsg.content, roomId, peerId);
-            const incoming: ChatMessage = { ...rawMsg, content: plainText };
+            const incoming: ChatMessage = {
+              ...rawMsg,
+              content: plainText,
+              deliveryStatus: 'received',
+            };
 
             setPrivateMessages((prev) => {
               if (prev.some((m) => m.id === incoming.id)) return prev;
@@ -582,6 +568,21 @@ export default function App() {
             setPeerOnline(true);
             setPeerDisconnected(false);
             playNotificationPing('message');
+
+            // Acknowledge receipt back over P2P channel
+            if (channel.readyState === 'open') {
+              try {
+                channel.send(
+                  JSON.stringify({
+                    type: 'p2p:ack',
+                    roomId,
+                    messageId: rawMsg.id,
+                  })
+                );
+              } catch {
+                // ignore
+              }
+            }
           }
         } catch {
           // Ignore malformed P2P frame
@@ -878,6 +879,22 @@ export default function App() {
     }
   }, [privateMessages.length, peerTyping, peerDisconnected, activeTab]);
 
+  // Smart Auto-Resizing Textarea Helper
+  const syncTextareaHeight = useCallback((el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = 'auto';
+    const nextHeight = Math.min(el.scrollHeight, 128);
+    el.style.height = `${Math.max(38, nextHeight)}px`;
+  }, []);
+
+  useEffect(() => {
+    syncTextareaHeight(globalInputRef.current);
+  }, [globalDraft, activeTab, syncTextareaHeight]);
+
+  useEffect(() => {
+    syncTextareaHeight(privateInputRef.current);
+  }, [privateDraft, activeTab, activeRoom?.room_id, syncTextareaHeight]);
+
   // Emoji Insertion Helper for Both Global and Private Chat
   const handleInsertEmoji = (emoji: string) => {
     if (pickerOpenFor === 'global') {
@@ -1055,10 +1072,20 @@ export default function App() {
           else if (payload.type === 'global:message:created' && payload.message) {
             const incomingRaw: ChatMessage = payload.message;
             const plainText = await decryptMessageContent(incomingRaw.content, 'GLOBAL');
-            const incoming: ChatMessage = { ...incomingRaw, content: plainText };
+            const incoming: ChatMessage = {
+              ...incomingRaw,
+              content: plainText,
+              deliveryStatus: incomingRaw.sender_id === myId ? 'sent' : 'received',
+            };
 
             setGlobalMessages((prev) => {
-              if (prev.some((m) => m.id === incoming.id)) return prev;
+              if (prev.some((m) => m.id === incoming.id)) {
+                return prev.map((m) =>
+                  m.id === incoming.id
+                    ? { ...m, deliveryStatus: m.deliveryStatus === 'sending' ? 'sent' : m.deliveryStatus }
+                    : m
+                );
+              }
               return [...prev, incoming];
             });
           }
@@ -1275,6 +1302,13 @@ export default function App() {
             setPeerOnline(otherOnline);
             if (otherOnline) {
               setPeerDisconnected(false);
+              setPrivateMessages((prev) =>
+                prev.map((m) =>
+                  m.sender_id === myId && m.deliveryStatus === 'sent'
+                    ? { ...m, deliveryStatus: 'received' }
+                    : m
+                )
+              );
             }
           }
 
@@ -1292,10 +1326,20 @@ export default function App() {
               incomingRaw.room_id,
               activePeerIdRef.current || incomingRaw.sender_id
             );
-            const incoming: ChatMessage = { ...incomingRaw, content: plainText };
+            const incoming: ChatMessage = {
+              ...incomingRaw,
+              content: plainText,
+              deliveryStatus: incomingRaw.sender_id === myId ? 'sent' : 'received',
+            };
 
             setPrivateMessages((prev) => {
-              if (prev.some((m) => m.id === incoming.id)) return prev;
+              if (prev.some((m) => m.id === incoming.id)) {
+                return prev.map((m) =>
+                  m.id === incoming.id && m.deliveryStatus === 'sending'
+                    ? { ...m, deliveryStatus: 'sent' }
+                    : m
+                );
+              }
               return [...prev, incoming];
             });
             if (incoming.sender_id !== myId) {
@@ -1408,7 +1452,20 @@ export default function App() {
               activeRoom.room_id,
               activePeerIdRef.current || undefined
             );
-            setPrivateMessages(decrypted);
+            setPrivateMessages((prev) => {
+              const prevStatusById = new Map(prev.map((m) => [m.id, m.deliveryStatus]));
+              return decrypted.map((m) => ({
+                ...m,
+                deliveryStatus:
+                  prevStatusById.get(m.id) === 'received'
+                    ? 'received'
+                    : m.sender_id === myId
+                    ? peerOnline
+                      ? 'received'
+                      : 'sent'
+                    : 'received',
+              }));
+            });
           }
         } catch {
           // Ignore transient network errors
@@ -1530,6 +1587,7 @@ export default function App() {
       content: text,
       timestamp: Date.now(),
       reactions: {},
+      deliveryStatus: 'sending',
     };
 
     setGlobalMessages((prev) => [...prev, optimisticMsg]);
@@ -1551,6 +1609,10 @@ export default function App() {
       if (!res.ok || !data.ok) {
         setGlobalMessages((prev) => prev.filter((m) => m.id !== tempId));
         setErrorBanner(data.error || 'Failed to post to Global Chat.');
+      } else {
+        setGlobalMessages((prev) =>
+          prev.map((m) => (m.id === tempId ? { ...m, deliveryStatus: 'sent' } : m))
+        );
       }
     } catch {
       setGlobalMessages((prev) => prev.filter((m) => m.id !== tempId));
@@ -1566,6 +1628,9 @@ export default function App() {
     const text = globalDraft;
     setGlobalDraft('');
     setPickerOpenFor(null);
+    if (globalInputRef.current) {
+      globalInputRef.current.style.height = '38px';
+    }
     await sendGlobalContent(text);
   };
 
@@ -1584,6 +1649,7 @@ export default function App() {
       content: text,
       timestamp: now,
       reactions: {},
+      deliveryStatus: 'sending',
     };
 
     seenMessageIdsRef.current.add(tempId);
@@ -1608,6 +1674,7 @@ export default function App() {
         activePeerId || undefined
       );
 
+      let sentOverP2P = false;
       // 1. If WebRTC P2P DataChannel is open, transmit encrypted frame directly peer-to-peer for sub-10ms delivery
       if (rtcChannelRef.current && rtcChannelRef.current.readyState === 'open') {
         try {
@@ -1625,6 +1692,7 @@ export default function App() {
               },
             })
           );
+          sentOverP2P = true;
         } catch {
           // Fallback to WebSocket/HTTP relay seamlessly
         }
@@ -1652,6 +1720,19 @@ export default function App() {
           setErrorBanner(data.error || 'Failed to send private message.');
         }
       } else {
+        setPrivateMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempId
+              ? {
+                  ...m,
+                  deliveryStatus:
+                    m.deliveryStatus === 'received' || sentOverP2P || peerOnline
+                      ? 'received'
+                      : 'sent',
+                }
+              : m
+          )
+        );
         fetchConversations();
       }
     } catch {
@@ -1668,6 +1749,9 @@ export default function App() {
     const text = privateDraft;
     setPrivateDraft('');
     setPickerOpenFor(null);
+    if (privateInputRef.current) {
+      privateInputRef.current.style.height = '38px';
+    }
     await sendPrivateContent(text);
   };
 
@@ -1801,11 +1885,20 @@ export default function App() {
     EMOJI_LIBRARY_CATEGORIES.find((c) => c.id === selectedCategoryId) ||
     EMOJI_LIBRARY_CATEGORIES[0];
 
-  // Render an Individual Message Item with Double-Tap ❤️, Long-Press Reaction Bar, Anti-Copy Lock, and TTL-Only Metadata
+  // Render an Individual Message Item with Double-Tap ❤️, Long-Press Reaction Bar, Delivery Status Badge, and 1h TTL Countdown
   const renderMessageItem = (msg: ChatMessage, isGlobal: boolean) => {
     const isMine = msg.sender_id === myId;
     const msgRemainingMs = Math.max(0, msg.timestamp + TTL_MS - nowTick);
     const reactionsMap: ReactionMap = msg.reactions || {};
+    const statusValue: MessageDeliveryStatus =
+      msg.deliveryStatus ||
+      (isMine ? ( !isGlobal && peerOnline ? 'received' : 'sent') : 'received');
+    const statusLabel =
+      statusValue === 'sending'
+        ? 'Sending...'
+        : statusValue === 'sent'
+        ? 'Sent'
+        : 'Received';
 
     // Group identical emojis and deduplicate user list per emoji
     const groupedReactions = Object.entries(reactionsMap)
@@ -1827,7 +1920,7 @@ export default function App() {
           isMine ? 'items-end' : 'items-start'
         }`}
       >
-        {/* Metadata Row: Sender ID + 1h TTL Countdown ONLY (No HH:MM:SS Send Timestamps) */}
+        {/* Metadata Row: Sender ID + 1h TTL Countdown + Subtle Delivery Status Badge */}
         <div className="flex flex-wrap items-center gap-1.5 mb-1 px-1 text-[10px] sm:text-[11px] text-zinc-400 font-mono tabular-nums max-w-full select-none">
           {isMine ? (
             <span className="text-emerald-400 font-semibold">{myId} (You)</span>
@@ -1848,6 +1941,18 @@ export default function App() {
             <Clock className="w-2.5 h-2.5 text-emerald-400/80 shrink-0" />
             <span>TTL: {formatCountdown(msgRemainingMs)}</span>
           </span>
+          <span className="text-zinc-600">·</span>
+          <span
+            className={`text-[10px] ${
+              statusValue === 'sending'
+                ? 'text-amber-400/90'
+                : statusValue === 'received'
+                ? 'text-emerald-400/90'
+                : 'text-zinc-500'
+            }`}
+          >
+            {statusLabel}
+          </span>
         </div>
 
         {/* Message Bubble + Isolated Reaction Bar Wrapper */}
@@ -1866,7 +1971,7 @@ export default function App() {
               e.preventDefault();
               openReactionMenuForMessage(msg.id, msg.room_id);
             }}
-            className={`relative w-fit max-w-full rounded-2xl transition-transform active:scale-[0.99] cursor-pointer select-none px-3.5 py-2.5 text-xs sm:text-sm leading-relaxed break-words ${
+            className={`relative w-fit max-w-full rounded-2xl transition-transform active:scale-[0.99] cursor-pointer select-none px-3.5 py-2.5 text-xs sm:text-sm leading-relaxed break-words whitespace-pre-wrap ${
               isMine
                 ? 'bg-emerald-500 text-zinc-950 font-medium rounded-br-xs'
                 : 'bg-zinc-900 border border-zinc-800 text-zinc-100 rounded-bl-xs'
@@ -2201,24 +2306,6 @@ export default function App() {
         e.preventDefault();
       }}
     >
-      {/* Privacy Screen Blur Shield when Tab Loses Focus / Visibility */}
-      {isPrivacyBlurred && (
-        <div
-          onClick={() => setIsPrivacyBlurred(false)}
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xl flex flex-col items-center justify-center p-6 text-center select-none"
-        >
-          <div className="w-12 h-12 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center text-emerald-400 mb-3 shadow-2xl">
-            <EyeOff className="w-6 h-6" />
-          </div>
-          <p className="text-sm font-semibold text-zinc-100 tracking-tight">
-            Privacy Shield Active
-          </p>
-          <p className="text-xs text-zinc-400 mt-1">
-            Return to window to resume session
-          </p>
-        </div>
-      )}
-
       {/* Streamlined Top Header: App Title ("WhisperNet"), Tiny Sound Icon Toggle, and User ID Copy Button */}
       <header className="shrink-0 w-full max-w-full flex items-center justify-between gap-3 px-3.5 sm:px-6 py-2.5 sm:py-3 border-b border-zinc-800/80 bg-black/95 backdrop-blur-md z-30 select-none">
         <a
@@ -2352,7 +2439,7 @@ export default function App() {
         )}
 
         {/* Right / Main Chat Viewport */}
-        <section className="flex-1 min-w-0 max-w-full h-full flex flex-col bg-black overflow-hidden">
+        <section className="flex-1 min-w-0 max-w-full h-full flex flex-col bg-black overflow-hidden relative">
           {/* Sub-Header Navigation Bar: Clean non-overlapping layout */}
           <div className="shrink-0 px-2.5 sm:px-6 py-2 border-b border-zinc-800/80 bg-zinc-950/70 flex items-center justify-between gap-1.5 sm:gap-3 w-full max-w-full overflow-hidden">
             <div className="flex items-center gap-1 sm:gap-2 min-w-0 flex-1 overflow-hidden">
@@ -2499,10 +2586,10 @@ export default function App() {
               {/* Extensive Emoji Library Popover */}
               {pickerOpenFor === 'global' && renderEmojiPicker()}
 
-              {/* Fixed Bottom Global Message Composer */}
+              {/* Fixed Bottom Global Message Composer (Smart Auto-Resizing Pure-Text Textarea) */}
               <form
                 onSubmit={handleSendGlobalMessage}
-                className="shrink-0 p-2.5 sm:p-3.5 border-t border-zinc-800/80 bg-zinc-950/90 flex items-center gap-2 w-full max-w-full"
+                className="shrink-0 p-2.5 sm:p-3.5 border-t border-zinc-800/80 bg-zinc-950/90 flex items-end gap-2 w-full max-w-full"
               >
                 <button
                   type="button"
@@ -2519,14 +2606,28 @@ export default function App() {
                 >
                   <Smile className="w-4 h-4" />
                 </button>
-                <input
+                <textarea
                   ref={globalInputRef}
-                  type="text"
+                  rows={1}
                   value={globalDraft}
                   onChange={(e) => setGlobalDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      if (globalDraft.trim() && !isSendingGlobal) {
+                        const text = globalDraft;
+                        setGlobalDraft('');
+                        setPickerOpenFor(null);
+                        if (globalInputRef.current) {
+                          globalInputRef.current.style.height = '38px';
+                        }
+                        sendGlobalContent(text);
+                      }
+                    }
+                  }}
                   placeholder={`Broadcast publicly as ${myId}...`}
                   maxLength={2000}
-                  className="select-text min-w-0 flex-1 px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 transition-colors"
+                  className="select-text min-w-0 flex-1 max-h-32 resize-none overflow-y-auto px-3 sm:px-4 py-2 text-xs sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 transition-colors"
                 />
                 <button
                   type="submit"
@@ -2735,10 +2836,10 @@ export default function App() {
                   {/* Extensive Emoji Library Popover */}
                   {pickerOpenFor === 'private' && !peerDisconnected && renderEmojiPicker()}
 
-                  {/* Fixed Bottom Private Message Input Composer (Disabled if Partner Disconnected) */}
+                  {/* Fixed Bottom Private Message Input Composer (Smart Auto-Resizing Pure-Text Textarea, Disabled if Partner Disconnected) */}
                   <form
                     onSubmit={handleSendPrivateMessage}
-                    className="shrink-0 p-2.5 sm:p-3.5 border-t border-zinc-800/80 bg-zinc-950/90 flex items-center gap-2 w-full max-w-full"
+                    className="shrink-0 p-2.5 sm:p-3.5 border-t border-zinc-800/80 bg-zinc-950/90 flex items-end gap-2 w-full max-w-full"
                   >
                     <button
                       type="button"
@@ -2758,19 +2859,33 @@ export default function App() {
                     >
                       <Smile className="w-4 h-4" />
                     </button>
-                    <input
+                    <textarea
                       ref={privateInputRef}
-                      type="text"
+                      rows={1}
                       disabled={peerDisconnected}
                       value={privateDraft}
                       onChange={(e) => handlePrivateDraftChange(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          if (privateDraft.trim() && !peerDisconnected && !isSendingPrivate) {
+                            const text = privateDraft;
+                            setPrivateDraft('');
+                            setPickerOpenFor(null);
+                            if (privateInputRef.current) {
+                              privateInputRef.current.style.height = '38px';
+                            }
+                            sendPrivateContent(text);
+                          }
+                        }
+                      }}
                       placeholder={
                         peerDisconnected
                           ? 'Partner disconnected / left the channel'
                           : `Message ${activePeerId}...`
                       }
                       maxLength={4000}
-                      className="select-text min-w-0 flex-1 px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      className="select-text min-w-0 flex-1 max-h-32 resize-none overflow-y-auto px-3 sm:px-4 py-2 text-xs sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                     />
                     <button
                       type="submit"
