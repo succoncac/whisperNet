@@ -55,36 +55,104 @@ loadRoomHashSecrets();
 
 /**
  * Advanced Client-Side URL Hash Encryption (#hash):
- * Parses `#room=<PEER_OR_ROOM>&key=<MASTER_SECRET>` or `#<MASTER_SECRET>` from `window.location.hash`.
+ * Parses `#peer=<PEER_OR_ROOM>&key=<MASTER_SECRET>` or `#<MASTER_SECRET>` from `window.location.hash`.
  * Since URL hash fragments are NEVER sent over HTTP to Cloudflare Workers, the server remains 100% blind to the key.
  */
-export function parseUrlHashContext(): { peerOrRoom?: string; hashSecret?: string } {
+export function isValidUrlHashSecret(secret?: string | null): boolean {
+  if (!secret || typeof secret !== 'string') return false;
+  const trimmed = secret.trim();
+  return trimmed.length >= 8 && /^[A-Za-z0-9_-]+$/.test(trimmed);
+}
+
+/**
+ * Checks if `window.location.hash` represents a private chat route/invite link
+ * (e.g., contains `#peer=`, `#room=`, `#key=`, or a direct secret hash).
+ */
+export function hasPrivateUrlHashRoute(): boolean {
+  if (typeof window === 'undefined' || !window.location.hash) return false;
+  const rawHash = window.location.hash.slice(1).trim();
+  if (!rawHash || rawHash.toLowerCase() === 'global') return false;
+  if (
+    rawHash.toLowerCase() === 'private' ||
+    rawHash.includes('peer=') ||
+    rawHash.includes('room=') ||
+    rawHash.includes('key=') ||
+    rawHash.startsWith('peer') ||
+    rawHash.startsWith('room') ||
+    rawHash.startsWith('key') ||
+    isValidUrlHashSecret(rawHash)
+  ) {
+    return true;
+  }
+  return true;
+}
+
+export function parseUrlHashContext(): {
+  peerOrRoom?: string;
+  hashSecret?: string;
+  hasMalformedOrMissingKeyInHash?: boolean;
+} {
   if (typeof window === 'undefined' || !window.location.hash) return {};
   const rawHash = window.location.hash.slice(1).trim();
   if (!rawHash || rawHash === 'global' || rawHash === 'private') return {};
 
-  if (rawHash.includes('=')) {
+  if (rawHash.includes('=') || rawHash.startsWith('peer') || rawHash.startsWith('room') || rawHash.startsWith('key')) {
     const params = new URLSearchParams(rawHash);
     const peerOrRoom = params.get('peer') || params.get('room') || undefined;
-    const hashSecret = params.get('key') || undefined;
-    if (peerOrRoom && hashSecret) {
-      roomHashSecretStore.set(peerOrRoom.trim().toUpperCase(), hashSecret);
+    const rawKey = params.get('key');
+    const validKey = isValidUrlHashSecret(rawKey) ? rawKey!.trim() : undefined;
+
+    if (peerOrRoom && validKey) {
+      roomHashSecretStore.set(peerOrRoom.trim().toUpperCase(), validKey);
       saveRoomHashSecrets();
-    } else if (hashSecret) {
-      roomHashSecretStore.set('DEFAULT', hashSecret);
-      saveRoomHashSecrets();
+      return { peerOrRoom, hashSecret: validKey, hasMalformedOrMissingKeyInHash: false };
     }
-    return { peerOrRoom, hashSecret };
+    if (validKey) {
+      roomHashSecretStore.set('DEFAULT', validKey);
+      saveRoomHashSecrets();
+      return { hashSecret: validKey, hasMalformedOrMissingKeyInHash: false };
+    }
+    return {
+      peerOrRoom,
+      hashSecret: undefined,
+      hasMalformedOrMissingKeyInHash: false,
+    };
   }
 
   // Direct `#master-key-xyz` format
-  if (rawHash.length >= 6) {
+  if (isValidUrlHashSecret(rawHash)) {
     roomHashSecretStore.set('DEFAULT', rawHash);
     saveRoomHashSecrets();
-    return { hashSecret: rawHash };
+    return { hashSecret: rawHash, hasMalformedOrMissingKeyInHash: false };
   }
 
-  return {};
+  return { hasMalformedOrMissingKeyInHash: false };
+}
+
+export function hasValidRoomEncryptionKey(roomId?: string | null, peerId?: string | null): boolean {
+  const urlCtx = parseUrlHashContext();
+  if (urlCtx.hasMalformedOrMissingKeyInHash) {
+    return false;
+  }
+  if (urlCtx.hashSecret && isValidUrlHashSecret(urlCtx.hashSecret)) {
+    return true;
+  }
+  const cleanRoom = roomId ? roomId.trim().toUpperCase() : '';
+  const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
+  const stored =
+    (cleanRoom ? roomHashSecretStore.get(cleanRoom) : undefined) ||
+    (cleanPeer ? roomHashSecretStore.get(cleanPeer) : undefined) ||
+    roomHashSecretStore.get('DEFAULT');
+  return isValidUrlHashSecret(stored);
+}
+
+export function getFullRoomInviteUrl(roomId: string, peerId: string, myId?: string): string {
+  if (typeof window === 'undefined') return '';
+  const cleanRoom = roomId.trim().toUpperCase();
+  const cleanPeer = peerId.trim().toUpperCase();
+  const secret = bootstrapRoomUrlHashSecret(cleanRoom, cleanPeer);
+  const targetPeerParam = myId ? myId.trim().toUpperCase() : cleanPeer;
+  return `${window.location.origin}${window.location.pathname}${window.location.search}#peer=${encodeURIComponent(targetPeerParam)}&key=${encodeURIComponent(secret)}`;
 }
 
 /**
@@ -92,12 +160,20 @@ export function parseUrlHashContext(): { peerOrRoom?: string; hashSecret?: strin
  * Generates and attaches a cryptographic secret hash to the browser URL (`#peer=USER-XXXX&key=...`)
  * when creating/joining a 1-on-1 room, ensuring zero-knowledge URL fragment key derivation.
  */
-export function bootstrapRoomUrlHashSecret(roomId: string, peerId?: string): string {
+export function bootstrapRoomUrlHashSecret(
+  roomId: string,
+  peerId?: string,
+  skipIfMalformedUrl = false
+): string {
   const cleanRoom = roomId.trim().toUpperCase();
   const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
 
   const urlCtx = parseUrlHashContext();
-  if (urlCtx.hashSecret) {
+  if (skipIfMalformedUrl && urlCtx.hasMalformedOrMissingKeyInHash) {
+    return '';
+  }
+
+  if (urlCtx.hashSecret && isValidUrlHashSecret(urlCtx.hashSecret)) {
     roomHashSecretStore.set(cleanRoom, urlCtx.hashSecret);
     if (cleanPeer) roomHashSecretStore.set(cleanPeer, urlCtx.hashSecret);
     saveRoomHashSecrets();
@@ -109,22 +185,11 @@ export function bootstrapRoomUrlHashSecret(roomId: string, peerId?: string): str
     (cleanPeer ? roomHashSecretStore.get(cleanPeer) : undefined) ||
     roomHashSecretStore.get('DEFAULT');
 
-  if (existing) {
-    if (typeof window !== 'undefined' && cleanRoom !== 'GLOBAL' && cleanPeer) {
-      try {
-        window.history.replaceState(
-          null,
-          '',
-          `${window.location.pathname}${window.location.search}#peer=${encodeURIComponent(cleanPeer)}&key=${encodeURIComponent(existing)}`
-        );
-      } catch {
-        // ignore
-      }
-    }
+  if (existing && isValidUrlHashSecret(existing)) {
     return existing;
   }
 
-  // Generate fresh deterministic-compatible or random URL hash key for invite URL sharing
+  // Generate fresh cryptographic session key
   const randomBytes = new Uint8Array(12);
   window.crypto.getRandomValues(randomBytes);
   const generatedSecret = Array.from(randomBytes)
@@ -134,18 +199,6 @@ export function bootstrapRoomUrlHashSecret(roomId: string, peerId?: string): str
   roomHashSecretStore.set(cleanRoom, generatedSecret);
   if (cleanPeer) roomHashSecretStore.set(cleanPeer, generatedSecret);
   saveRoomHashSecrets();
-
-  if (typeof window !== 'undefined' && cleanRoom !== 'GLOBAL' && cleanPeer) {
-    try {
-      window.history.replaceState(
-        null,
-        '',
-        `${window.location.pathname}${window.location.search}#peer=${encodeURIComponent(cleanPeer)}&key=${encodeURIComponent(generatedSecret)}`
-      );
-    } catch {
-      // ignore
-    }
-  }
 
   return generatedSecret;
 }
@@ -203,6 +256,12 @@ export function registerPeerPublicKey(peerId: string, publicKeyJwkStr?: string |
   for (const cacheKey of Array.from(derivedRoomKeyCache.keys())) {
     if (cacheKey.includes(cleanId)) {
       derivedRoomKeyCache.delete(cacheKey);
+    }
+  }
+  // Clear cached failed decryptions so messages re-decrypt cleanly once peer key arrives
+  for (const [k, v] of Array.from(decryptedPayloadCache.entries())) {
+    if (v.startsWith('[Decryption Failed') || k.includes(cleanId)) {
+      decryptedPayloadCache.delete(k);
     }
   }
   try {
@@ -446,19 +505,19 @@ export async function initializeRoomSessionKey(
   await getRoomAesGcmKey(roomId, 'deterministic', cleanPeer);
 }
 
-// Encrypt plaintext on the client using AES-256-GCM before network transmission
+// Encrypt plaintext on the client using AES-256-GCM before network transmission (only for Private 1-on-1 rooms; GLOBAL chat sends normal readable plaintext)
 export async function encryptMessageContent(
   plaintext: string,
   roomId: string,
   peerId?: string
 ): Promise<string> {
-  const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
-  const hasPeerEcdh = Boolean(
-    cleanPeer && roomId !== 'GLOBAL' && peerPublicKeyStore.has(cleanPeer)
-  );
-  const mode: 'ecdh' | 'deterministic' = hasPeerEcdh ? 'ecdh' : 'deterministic';
+  if (!roomId || roomId.trim().toUpperCase() === 'GLOBAL') {
+    return plaintext;
+  }
 
-  const key = await getRoomAesGcmKey(roomId, mode, cleanPeer);
+  const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
+  // Use deterministic PBKDF2-SHA256 room key so both 1-on-1 participants always derive the exact same AES-256-GCM key and can read messages immediately without key mismatch
+  const key = await getRoomAesGcmKey(roomId, 'deterministic', cleanPeer);
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
   const encodedPlaintext = new TextEncoder().encode(plaintext);
 
@@ -470,9 +529,8 @@ export async function encryptMessageContent(
 
   const ivB64 = bytesToBase64(iv);
   const cipherB64 = bytesToBase64(new Uint8Array(cipherBuffer));
-  const modeFlag = mode === 'ecdh' ? 'E' : 'D';
 
-  return `${E2EE_ENVELOPE_PREFIX}${modeFlag}:${ivB64}:${cipherB64}`;
+  return `${E2EE_ENVELOPE_PREFIX}D:${ivB64}:${cipherB64}`;
 }
 
 // Decrypt AES-256-GCM ciphertext exclusively on the client browser (with bounded in-memory LRU cache)
@@ -508,18 +566,26 @@ export async function decryptMessageContent(
       ivB64 = parts[0];
       cipherB64 = parts[1];
     } else {
-      return '[Encrypted Payload]';
+      return '[Decryption Failed: Missing or invalid key]';
     }
 
     const iv = base64ToBytes(ivB64);
     const cipherBytes = base64ToBytes(cipherB64);
 
-    if (modeFlag === 'H') {
+    const candidateModes: Array<'deterministic' | 'ecdh' | 'hash'> =
+      modeFlag === 'H'
+        ? ['deterministic', 'hash', 'ecdh']
+        : modeFlag === 'E'
+        ? ['deterministic', 'ecdh', 'hash']
+        : ['deterministic', 'ecdh', 'hash'];
+
+    for (const candidateMode of candidateModes) {
+      if (candidateMode === 'ecdh' && !cleanPeer) continue;
       try {
-        const hashKey = await getRoomAesGcmKey(roomId, 'hash', cleanPeer);
+        const candidateKey = await getRoomAesGcmKey(roomId, candidateMode, cleanPeer);
         const decryptedBuffer = await window.crypto.subtle.decrypt(
           { name: 'AES-GCM', iv },
-          hashKey,
+          candidateKey,
           cipherBytes
         );
         const decoded = new TextDecoder().decode(decryptedBuffer);
@@ -530,44 +596,12 @@ export async function decryptMessageContent(
         decryptedPayloadCache.set(cacheKey, decoded);
         return decoded;
       } catch {
-        // Fallback attempt with ECDH or deterministic room key
+        // Try next candidate key mode
       }
     }
 
-    if (modeFlag === 'E' && cleanPeer) {
-      try {
-        const ecdhKey = await getRoomAesGcmKey(roomId, 'ecdh', cleanPeer);
-        const decryptedBuffer = await window.crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv },
-          ecdhKey,
-          cipherBytes
-        );
-        const decoded = new TextDecoder().decode(decryptedBuffer);
-        if (decryptedPayloadCache.size > 600) {
-          const firstKey = decryptedPayloadCache.keys().next().value;
-          if (firstKey) decryptedPayloadCache.delete(firstKey);
-        }
-        decryptedPayloadCache.set(cacheKey, decoded);
-        return decoded;
-      } catch {
-        // Fallback attempt with deterministic room key
-      }
-    }
-
-    const detKey = await getRoomAesGcmKey(roomId, 'deterministic', cleanPeer);
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv },
-      detKey,
-      cipherBytes
-    );
-    const decoded = new TextDecoder().decode(decryptedBuffer);
-    if (decryptedPayloadCache.size > 600) {
-      const firstKey = decryptedPayloadCache.keys().next().value;
-      if (firstKey) decryptedPayloadCache.delete(firstKey);
-    }
-    decryptedPayloadCache.set(cacheKey, decoded);
-    return decoded;
+    return '[Decryption Failed: Missing or invalid key]';
   } catch {
-    return '[Encrypted Message]';
+    return '[Decryption Failed: Missing or invalid key]';
   }
 }

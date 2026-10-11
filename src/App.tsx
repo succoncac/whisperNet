@@ -29,6 +29,7 @@ import {
   initializeRoomSessionKey,
   purgeRoomCryptoSession,
   parseUrlHashContext,
+  hasPrivateUrlHashRoute,
   bootstrapRoomUrlHashSecret,
   encryptMessageContent,
   decryptMessageContent,
@@ -60,6 +61,7 @@ interface PrivateConversationSummary {
   room_id: string;
   peer_id: string;
   peer_public_key?: string | null;
+  peer_alive?: boolean;
   created_at: number;
   expires_at: number;
   message_count: number;
@@ -317,8 +319,21 @@ function renderInlineMarkdown(text: string, isMine: boolean): React.ReactNode[] 
   });
 }
 
-function renderFormattedMessageContent(content: string, isMine: boolean): React.ReactNode {
+function renderFormattedMessageContent(
+  content: string,
+  isMine: boolean,
+  copiedCodeKey?: string | null,
+  onCopyCodeBlock?: (codeText: string, key: string) => void
+): React.ReactNode {
   if (!content) return null;
+  if (content === '[Decryption Failed: Missing or invalid key]') {
+    return (
+      <div className="inline-flex items-center gap-1.5 font-mono text-xs text-rose-300 bg-rose-950/70 border border-rose-800/80 px-2.5 py-1 rounded-md">
+        <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+        <span>[Decryption Failed: Missing or invalid key]</span>
+      </div>
+    );
+  }
   const blockRegex = /```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g;
   const segments: Array<
     | { type: 'text'; value: string }
@@ -346,20 +361,45 @@ function renderFormattedMessageContent(content: string, isMine: boolean): React.
     <div className="space-y-1.5">
       {segments.map((seg, i) => {
         if (seg.type === 'code') {
+          const codeKey = `code-${i}-${seg.value.length}`;
+          const isCopied = copiedCodeKey === codeKey;
           return (
             <div
               key={i}
+              onClick={(e) => e.stopPropagation()}
               className={`my-1 rounded-lg overflow-hidden border text-left ${
                 isMine
                   ? 'bg-zinc-950/90 border-zinc-800 text-zinc-100'
                   : 'bg-black/90 border-zinc-800 text-zinc-100'
               }`}
             >
-              {seg.lang && (
-                <div className="px-2.5 py-1 bg-zinc-900/90 border-b border-zinc-800 text-[10px] font-mono text-emerald-400 uppercase tracking-wider">
-                  {seg.lang}
-                </div>
-              )}
+              <div className="px-2.5 py-1 bg-zinc-900/90 border-b border-zinc-800 flex items-center justify-between gap-2 text-[10px] font-mono">
+                <span className="text-emerald-400 uppercase tracking-wider">
+                  {seg.lang || 'code'}
+                </span>
+                {onCopyCodeBlock && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCopyCodeBlock(seg.value, codeKey);
+                    }}
+                    className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 flex items-center gap-1 transition-colors cursor-pointer"
+                  >
+                    {isCopied ? (
+                      <>
+                        <Check className="w-2.5 h-2.5 text-emerald-400" />
+                        <span className="text-emerald-400">Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-2.5 h-2.5" />
+                        <span>Copy</span>
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
               <pre className="p-2.5 text-[11px] sm:text-xs font-mono leading-relaxed overflow-x-auto whitespace-pre select-text">
                 <code>{seg.value}</code>
               </pre>
@@ -419,9 +459,16 @@ export default function App() {
   const previousUserIdRef = useRef<string | null>(null);
 
   // Navigation Tabs: 'global' (Global Chat) | 'private' (Private Chats)
+  // Critical URL Hash Auto-Routing: Automatically switch to 'private' on load if window.location.hash contains a private route (#peer= or #key=), only defaulting to 'global' when URL hash is empty
   const [activeTab, setActiveTab] = useState<'global' | 'private'>(() => {
     try {
-      return sessionStorage.getItem(SESSION_ACTIVE_TAB_KEY) === 'private' ? 'private' : 'global';
+      if (hasPrivateUrlHashRoute()) {
+        return 'private';
+      }
+      if (typeof window !== 'undefined' && (!window.location.hash || window.location.hash === '#')) {
+        return sessionStorage.getItem(SESSION_ACTIVE_TAB_KEY) === 'private' ? 'private' : 'global';
+      }
+      return 'global';
     } catch {
       return 'global';
     }
@@ -446,6 +493,8 @@ export default function App() {
 
   // Stale Session / Disconnected Partner State ("Ghost Chat" Prevention)
   const [peerDisconnected, setPeerDisconnected] = useState<boolean>(false);
+  const [disconnectedPeersMap, setDisconnectedPeersMap] = useState<Record<string, boolean>>({});
+  const [copiedCodeBlockIdx, setCopiedCodeBlockIdx] = useState<string | null>(null);
 
   // Web Audio API Sound Notification State
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
@@ -475,6 +524,13 @@ export default function App() {
   const [isNuking, setIsNuking] = useState<boolean>(false);
   const [showNukeModal, setShowNukeModal] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<boolean>(false);
+  const [missingUrlHashKey, setMissingUrlHashKey] = useState<boolean>(() => {
+    try {
+      return Boolean(parseUrlHashContext().hasMalformedOrMissingKeyInHash);
+    } catch {
+      return false;
+    }
+  });
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [nukeAlert, setNukeAlert] = useState<string | null>(null);
 
@@ -1137,7 +1193,20 @@ export default function App() {
         const data = await res.json();
 
         if (!res.ok || !data.ok) {
-          setErrorBanner(data.error || 'User not found. Please check the ID and try again.');
+          // If checking/opening an existing conversation where the peer is offline/not found, mark it Disconnected on the card instead of showing a top error banner
+          const hasExistingCard = conversations.some((c) => c.peer_id === targetPeer);
+          if (hasExistingCard || !notifyPeer) {
+            setDisconnectedPeersMap((prev) => ({ ...prev, [targetPeer]: true }));
+            setConversations((prev) =>
+              prev.map((c) => (c.peer_id === targetPeer ? { ...c, peer_alive: false } : c))
+            );
+            if (activePeerIdRef.current === targetPeer) {
+              setPeerOnline(false);
+              setPeerDisconnected(true);
+            }
+          } else {
+            setErrorBanner(data.error || 'User not found. Please check the ID and try again.');
+          }
           setIsConnecting(false);
           return;
         }
@@ -1146,9 +1215,18 @@ export default function App() {
           registerPeerPublicKey(targetPeer, data.room.peer_public_key);
         }
 
+        const isPeerDead = data.room?.peer_alive === false;
+        setDisconnectedPeersMap((prev) => ({ ...prev, [targetPeer]: isPeerDead }));
+
         // Automatically derive temporary cryptographic session key & attach URL #hash secret
-        bootstrapRoomUrlHashSecret(data.room.room_id, targetPeer);
-        await initializeRoomSessionKey(data.room.room_id, targetPeer);
+        const currentHashCtx = parseUrlHashContext();
+        if (currentHashCtx.hasMalformedOrMissingKeyInHash) {
+          setMissingUrlHashKey(true);
+        } else {
+          setMissingUrlHashKey(false);
+          bootstrapRoomUrlHashSecret(data.room.room_id, targetPeer);
+          await initializeRoomSessionKey(data.room.room_id, targetPeer);
+        }
 
         const rawMessages: ChatMessage[] = Array.isArray(data.messages) ? data.messages : [];
         rawMessages.forEach((m) => seenMessageIdsRef.current.add(m.id));
@@ -1160,7 +1238,9 @@ export default function App() {
         );
 
         setActivePeerId(targetPeer);
+        activePeerIdRef.current = targetPeer;
         setActiveRoom(data.room);
+        activeRoomIdRef.current = data.room?.room_id || null;
         setPeerDisconnected(data.room?.peer_alive === false);
         setPrivateMessages(decryptedMessages);
         setActiveTab('private');
@@ -1203,24 +1283,64 @@ export default function App() {
     [myId, fetchConversations, initiateBackgroundWebRtcP2P]
   );
 
-  // Restore active 1-on-1 room automatically across page refresh (F5) or from URL #hash invite
+  // Restore active 1-on-1 room automatically on initial load (DOMContentLoaded / mount), across page refresh (F5), or from URL #hash invite, and monitor hashchange for auto-routing & key validation
   useEffect(() => {
-    if (restoredSessionPeerRef.current) return;
-    restoredSessionPeerRef.current = true;
-    try {
-      const hashCtx = parseUrlHashContext();
-      const hashPeer = hashCtx.peerOrRoom ? normalizeUserCode(hashCtx.peerOrRoom) : '';
-      if (hashPeer && /^USER-[A-Z0-9]{4,8}$/.test(hashPeer) && hashPeer !== myId) {
-        connectToPeerChannel(hashPeer, false);
-        return;
+    const handleHashRouteAndValidation = (initiateHandshakeIfPeer = true) => {
+      try {
+        const isPrivateHash = hasPrivateUrlHashRoute();
+        const hashCtx = parseUrlHashContext();
+        setMissingUrlHashKey(Boolean(hashCtx.hasMalformedOrMissingKeyInHash));
+
+        if (isPrivateHash) {
+          // Immediately switch view tab from Global Chat to Private Chats when #peer= or #key= is present
+          setActiveTab('private');
+          const hashPeer = hashCtx.peerOrRoom ? normalizeUserCode(hashCtx.peerOrRoom) : '';
+          if (hashPeer && /^USER-[A-Z0-9]{4,8}$/.test(hashPeer)) {
+            setPeerInput(hashPeer);
+            if (initiateHandshakeIfPeer && hashPeer !== myId && hashPeer !== activePeerIdRef.current) {
+              connectToPeerChannel(hashPeer, true);
+            }
+          }
+          return true;
+        }
+      } catch {
+        // ignore
       }
-      const savedPeer = sessionStorage.getItem(SESSION_ACTIVE_PEER_KEY);
-      if (savedPeer && /^USER-[A-Z0-9]{4,8}$/.test(savedPeer) && savedPeer !== myId) {
-        connectToPeerChannel(savedPeer, false);
-      }
-    } catch {
-      // ignore
+      return false;
+    };
+
+    const onHashChange = () => {
+      handleHashRouteAndValidation(true);
+    };
+
+    const onDomContentLoaded = () => {
+      handleHashRouteAndValidation(true);
+    };
+
+    window.addEventListener('hashchange', onHashChange);
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', onDomContentLoaded);
     }
+
+    if (!restoredSessionPeerRef.current) {
+      restoredSessionPeerRef.current = true;
+      const handledByHash = handleHashRouteAndValidation(true);
+      if (!handledByHash) {
+        try {
+          const savedPeer = sessionStorage.getItem(SESSION_ACTIVE_PEER_KEY);
+          if (savedPeer && /^USER-[A-Z0-9]{4,8}$/.test(savedPeer) && savedPeer !== myId) {
+            connectToPeerChannel(savedPeer, false);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    return () => {
+      window.removeEventListener('hashchange', onHashChange);
+      window.removeEventListener('DOMContentLoaded', onDomContentLoaded);
+    };
   }, [myId, connectToPeerChannel]);
 
   // Multi-Tab Synchronization via Native BroadcastChannel API
@@ -1386,6 +1506,10 @@ export default function App() {
             payload.userId
           ) {
             const departedUser = String(payload.userId);
+            setDisconnectedPeersMap((prev) => ({ ...prev, [departedUser]: true }));
+            setConversations((prev) =>
+              prev.map((c) => (c.peer_id === departedUser ? { ...c, peer_alive: false } : c))
+            );
             if (
               departedUser === activePeerIdRef.current ||
               (payload.roomId && payload.roomId === activeRoomIdRef.current)
@@ -1851,11 +1975,10 @@ export default function App() {
 
     for (const item of snapshot) {
       try {
-        const encryptedCiphertext = await encryptMessageContent(
-          item.rawText,
-          item.roomId,
-          item.peerId
-        );
+        const outgoingContent =
+          item.scope === 'global'
+            ? item.rawText
+            : await encryptMessageContent(item.rawText, item.roomId, item.peerId);
         const endpoint =
           item.scope === 'global'
             ? '/api/global/messages'
@@ -1867,7 +1990,7 @@ export default function App() {
           body: JSON.stringify({
             id: item.id,
             senderId: myId,
-            content: encryptedCiphertext,
+            content: outgoingContent,
           }),
         });
         const data = await res.json();
@@ -1931,15 +2054,13 @@ export default function App() {
     setIsSendingGlobal(true);
 
     try {
-      const encryptedCiphertext = await encryptMessageContent(text, 'GLOBAL');
-
       const res = await fetch('/api/global/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           id: tempId,
           senderId: myId,
-          content: encryptedCiphertext,
+          content: text,
         }),
       });
       const data = await res.json();
@@ -1984,7 +2105,7 @@ export default function App() {
 
   // Transmit Private 1-on-1 Content (Hybrid WebRTC P2P Fast-Path + Reliable WebSocket/REST Fallback)
   const sendPrivateContent = async (rawContent: string) => {
-    if (!activeRoom || isSendingPrivate || peerDisconnected) return;
+    if (!activeRoom || isSendingPrivate || peerDisconnected || missingUrlHashKey) return;
     const text = rawContent.trim();
     if (!text) return;
 
@@ -2105,7 +2226,7 @@ export default function App() {
 
   const handleSendPrivateMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!privateDraft.trim() || peerDisconnected) return;
+    if (!privateDraft.trim() || peerDisconnected || missingUrlHashKey) return;
     const text = privateDraft;
     setPrivateDraft('');
     setPickerOpenFor(null);
@@ -2116,7 +2237,7 @@ export default function App() {
   };
 
   const handlePrivateDraftChange = (val: string) => {
-    if (peerDisconnected) return;
+    if (peerDisconnected || missingUrlHashKey) return;
     setPrivateDraft(val);
     if (!activeRoom) return;
 
@@ -2179,6 +2300,57 @@ export default function App() {
       }
     }, 2000);
   };
+
+  // Instant Conversation Deletion (Single-Tap Purge from Conversation Card)
+  const handleInstantDeleteConversation = useCallback(
+    async (roomId: string, peerId: string, e?: React.MouseEvent) => {
+      if (e) {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+
+      // Immediately remove from UI conversation list & unread badges
+      setConversations((prev) => prev.filter((c) => c.room_id !== roomId && c.peer_id !== peerId));
+      setUnreadByPeer((prev) => {
+        if (!prev[peerId]) return prev;
+        const next = { ...prev };
+        delete next[peerId];
+        return next;
+      });
+      setDisconnectedPeersMap((prev) => {
+        if (!(peerId in prev)) return prev;
+        const next = { ...prev };
+        delete next[peerId];
+        return next;
+      });
+
+      if (activeRoomIdRef.current === roomId || activePeerIdRef.current === peerId) {
+        closeWebRtcChannel();
+        setPrivateMessages([]);
+        setActiveRoom(null);
+        setActivePeerId(null);
+        setPeerDisconnected(false);
+        setShowNukeModal(false);
+      }
+
+      purgeRoomCryptoSession(roomId);
+      broadcastChannelRef.current?.postMessage({
+        type: 'sync:room_nuked',
+        roomId,
+      });
+
+      try {
+        await fetch(`/api/rooms/${encodeURIComponent(roomId)}/nuke`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ triggeredBy: myId }),
+        });
+      } catch {
+        // Ignore transient network errors; local conversation state is already purged
+      }
+    },
+    [myId, closeWebRtcChannel]
+  );
 
   // Execute "Nuke Chat" (Triggers Bilateral In-Memory + Storage deleteAll() Hard Wipe)
   const handleConfirmNuke = async () => {
@@ -2342,7 +2514,22 @@ export default function App() {
                 : 'bg-zinc-900 border border-zinc-800 text-zinc-100 rounded-bl-xs'
             }`}
           >
-            {renderFormattedMessageContent(msg.content, isMine)}
+            {renderFormattedMessageContent(
+              msg.content,
+              isMine,
+              copiedCodeBlockIdx?.startsWith(`${msg.id}-`)
+                ? copiedCodeBlockIdx.slice(msg.id.length + 1)
+                : null,
+              (codeText, codeKey) => {
+                navigator.clipboard.writeText(codeText);
+                setCopiedCodeBlockIdx(`${msg.id}-${codeKey}`);
+                window.setTimeout(() => {
+                  setCopiedCodeBlockIdx((prev) =>
+                    prev === `${msg.id}-${codeKey}` ? null : prev
+                  );
+                }, 1600);
+              }
+            )}
 
             {/* Animated Floating Heart on Double-Tap */}
             {isHeartBursting && (
@@ -2471,23 +2658,25 @@ export default function App() {
             <span className="text-base sm:text-lg font-mono font-semibold tracking-wider text-zinc-100 tabular-nums truncate">
               {myId}
             </span>
-            <button
-              type="button"
-              onClick={copyMyId}
-              className="px-2.5 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-            >
-              {copiedId ? (
-                <>
-                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Copied</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="w-3.5 h-3.5" />
-                  <span>Copy ID</span>
-                </>
-              )}
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={copyMyId}
+                className="px-2.5 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+              >
+                {copiedId ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy ID</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -2550,13 +2739,24 @@ export default function App() {
                   activeTab === 'private' && activePeerId === conv.peer_id;
                 const unreadCount = unreadByPeer[conv.peer_id] || 0;
                 const isPeerOnlineNow = onlineUsers.includes(conv.peer_id);
+                const isPeerDisconnectedCard =
+                  conv.peer_alive === false ||
+                  Boolean(disconnectedPeersMap[conv.peer_id]) ||
+                  !isPeerOnlineNow;
 
                 return (
-                  <button
+                  <div
                     key={conv.room_id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     onClick={() => connectToPeerChannel(conv.peer_id, false)}
-                    className={`w-full p-2.5 text-left rounded-lg transition-colors flex flex-col gap-1 cursor-pointer border select-none ${
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        connectToPeerChannel(conv.peer_id, false);
+                      }
+                    }}
+                    className={`w-full p-2.5 text-left rounded-lg transition-colors flex flex-col gap-1 cursor-pointer border select-none group ${
                       isSelected
                         ? 'bg-zinc-800/90 border-zinc-700'
                         : unreadCount > 0
@@ -2565,31 +2765,51 @@ export default function App() {
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2 min-w-0">
-                      <div className="flex items-center gap-1.5 font-mono text-xs font-semibold text-zinc-200 truncate">
-                        <span className={isSelected ? 'text-emerald-400' : ''}>
+                      <div className="flex items-center gap-1.5 font-mono text-xs font-semibold text-zinc-200 min-w-0 truncate">
+                        <span className={`truncate ${isSelected ? 'text-emerald-400' : ''}`}>
                           {conv.peer_id}
                         </span>
-                        <span className="text-zinc-600">·</span>
-                        <span className="text-[10px] font-normal text-zinc-400">
-                          {isPeerOnlineNow ? 'Online' : 'Offline'}
-                        </span>
+                        {isPeerDisconnectedCard ? (
+                          <span className="px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-800/70 text-[10px] font-mono font-medium text-rose-300 shrink-0">
+                            Disconnected
+                          </span>
+                        ) : (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-950/70 border border-emerald-800/60 text-[10px] font-mono font-medium text-emerald-300 shrink-0">
+                            Online
+                          </span>
+                        )}
                       </div>
-                      {unreadCount > 0 ? (
-                        <span className="font-mono text-[11px] font-bold text-amber-400 tabular-nums shrink-0">
-                          {unreadCount} new
-                        </span>
-                      ) : (
-                        <span className="font-mono text-[10px] text-zinc-500 tabular-nums shrink-0">
-                          {conv.message_count} msgs
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {unreadCount > 0 ? (
+                          <span className="font-mono text-[11px] font-bold text-amber-400 tabular-nums shrink-0">
+                            {unreadCount} new
+                          </span>
+                        ) : (
+                          <span className="font-mono text-[10px] text-zinc-500 tabular-nums shrink-0">
+                            {conv.message_count} msgs
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) =>
+                            handleInstantDeleteConversation(conv.room_id, conv.peer_id, e)
+                          }
+                          title={`Delete conversation with ${conv.peer_id}`}
+                          aria-label={`Delete conversation with ${conv.peer_id}`}
+                          className="p-1 rounded-md text-zinc-500 hover:text-rose-400 hover:bg-rose-950/60 transition-colors cursor-pointer shrink-0"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
                     <p className="text-[11px] text-zinc-400 truncate">
                       {conv.last_message
                         ? `${conv.last_message.sender_id === myId ? 'You: ' : ''}${conv.last_message.content}`
+                        : isPeerDisconnectedCard
+                        ? 'Peer disconnected — tap trash to delete'
                         : 'Private channel ready — tap to open'}
                     </p>
-                  </button>
+                  </div>
                 );
               })
             )}
@@ -3067,12 +3287,24 @@ export default function App() {
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {conversations.map((conv) => {
                             const unreadCount = unreadByPeer[conv.peer_id] || 0;
+                            const isPeerOnlineNow = onlineUsers.includes(conv.peer_id);
+                            const isPeerDisconnectedCard =
+                              conv.peer_alive === false ||
+                              Boolean(disconnectedPeersMap[conv.peer_id]) ||
+                              !isPeerOnlineNow;
 
                             return (
-                              <button
+                              <div
                                 key={conv.room_id}
-                                type="button"
+                                role="button"
+                                tabIndex={0}
                                 onClick={() => connectToPeerChannel(conv.peer_id, false)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    connectToPeerChannel(conv.peer_id, false);
+                                  }
+                                }}
                                 className={`p-3 rounded-xl border text-left transition-colors flex flex-col justify-between gap-1.5 cursor-pointer min-w-0 select-none ${
                                   unreadCount > 0
                                     ? 'bg-emerald-950/30 border-emerald-600/80 hover:bg-emerald-950/50'
@@ -3080,25 +3312,55 @@ export default function App() {
                                 }`}
                               >
                                 <div className="flex items-center justify-between gap-2 min-w-0">
-                                  <span className="font-mono text-xs sm:text-sm font-semibold text-emerald-400 truncate">
-                                    {conv.peer_id}
-                                  </span>
-                                  {unreadCount > 0 ? (
-                                    <span className="font-mono text-xs font-bold text-amber-400 shrink-0">
-                                      {unreadCount} new
+                                  <div className="flex items-center gap-1.5 min-w-0 truncate">
+                                    <span className="font-mono text-xs sm:text-sm font-semibold text-emerald-400 truncate">
+                                      {conv.peer_id}
                                     </span>
-                                  ) : (
-                                    <span className="font-mono text-xs text-zinc-500 shrink-0">
-                                      Open →
-                                    </span>
-                                  )}
+                                    {isPeerDisconnectedCard ? (
+                                      <span className="px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-800/70 text-[10px] font-mono font-medium text-rose-300 shrink-0">
+                                        Disconnected
+                                      </span>
+                                    ) : (
+                                      <span className="px-1.5 py-0.5 rounded bg-emerald-950/70 border border-emerald-800/60 text-[10px] font-mono font-medium text-emerald-300 shrink-0">
+                                        Online
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {unreadCount > 0 ? (
+                                      <span className="font-mono text-xs font-bold text-amber-400 shrink-0">
+                                        {unreadCount} new
+                                      </span>
+                                    ) : (
+                                      <span className="font-mono text-xs text-zinc-500 shrink-0">
+                                        Open →
+                                      </span>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) =>
+                                        handleInstantDeleteConversation(
+                                          conv.room_id,
+                                          conv.peer_id,
+                                          e
+                                        )
+                                      }
+                                      title={`Delete conversation with ${conv.peer_id}`}
+                                      aria-label={`Delete conversation with ${conv.peer_id}`}
+                                      className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-400 hover:bg-rose-950/60 transition-colors cursor-pointer shrink-0"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
                                 </div>
                                 <p className="text-xs text-zinc-300 truncate">
                                   {conv.last_message
                                     ? conv.last_message.content
+                                    : isPeerDisconnectedCard
+                                    ? 'Disconnected — tap trash icon to delete conversation'
                                     : `${conv.peer_id} initiated a private session`}
                                 </p>
-                              </button>
+                              </div>
                             );
                           })}
                         </div>
@@ -3212,19 +3474,19 @@ export default function App() {
                   {/* Extensive Emoji Library Popover */}
                   {pickerOpenFor === 'private' && !peerDisconnected && renderEmojiPicker()}
 
-                  {/* Fixed Bottom Private Message Input Composer (Smart Auto-Resizing Pure-Text Textarea, Disabled if Partner Disconnected) */}
+                  {/* Fixed Bottom Private Message Input Composer (Smart Auto-Resizing Pure-Text Textarea, Disabled if Partner Disconnected or Missing URL Key) */}
                   <form
                     onSubmit={handleSendPrivateMessage}
                     className="shrink-0 p-2.5 sm:p-3.5 border-t border-zinc-800/80 bg-zinc-950/90 flex items-end gap-2 w-full max-w-full"
                   >
                     <button
                       type="button"
-                      disabled={peerDisconnected}
+                      disabled={peerDisconnected || missingUrlHashKey}
                       onClick={() =>
                         setPickerOpenFor((prev) => (prev === 'private' ? null : 'private'))
                       }
                       className={`p-2 sm:p-2.5 rounded-lg border transition-colors shrink-0 flex items-center gap-1 ${
-                        peerDisconnected
+                        peerDisconnected || missingUrlHashKey
                           ? 'bg-zinc-900/40 border-zinc-800/50 text-zinc-600 cursor-not-allowed opacity-50'
                           : pickerOpenFor === 'private'
                           ? 'bg-zinc-800 border-emerald-500/60 text-emerald-400 cursor-pointer'
@@ -3238,13 +3500,18 @@ export default function App() {
                     <textarea
                       ref={privateInputRef}
                       rows={1}
-                      disabled={peerDisconnected}
+                      disabled={peerDisconnected || missingUrlHashKey}
                       value={privateDraft}
                       onChange={(e) => handlePrivateDraftChange(e.target.value)}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter' && !e.shiftKey) {
                           e.preventDefault();
-                          if (privateDraft.trim() && !peerDisconnected && !isSendingPrivate) {
+                          if (
+                            privateDraft.trim() &&
+                            !peerDisconnected &&
+                            !missingUrlHashKey &&
+                            !isSendingPrivate
+                          ) {
                             const text = privateDraft;
                             setPrivateDraft('');
                             setPickerOpenFor(null);
@@ -3256,7 +3523,9 @@ export default function App() {
                         }
                       }}
                       placeholder={
-                        peerDisconnected
+                        missingUrlHashKey
+                          ? 'Missing encryption key in URL. Please use the complete invite link.'
+                          : peerDisconnected
                           ? 'Partner disconnected / left the channel'
                           : `Message ${activePeerId}...`
                       }
@@ -3265,7 +3534,12 @@ export default function App() {
                     />
                     <button
                       type="submit"
-                      disabled={peerDisconnected || !privateDraft.trim() || isSendingPrivate}
+                      disabled={
+                        peerDisconnected ||
+                        missingUrlHashKey ||
+                        !privateDraft.trim() ||
+                        isSendingPrivate
+                      }
                       className="px-3.5 sm:px-5 py-2 sm:py-2.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-950 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <span>Send</span>

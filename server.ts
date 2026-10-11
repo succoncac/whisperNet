@@ -645,6 +645,7 @@ async function startServer() {
           room_id: roomId,
           peer_id: peerId,
           peer_public_key: getPeerPublicKey(peerId),
+          peer_alive: doesUserExistOrOnline(peerId),
           created_at: createdAt,
           expires_at: createdAt + TTL_MS,
           message_count: validMsgs.length,
@@ -798,7 +799,19 @@ async function startServer() {
       const myPublicKey = req.body?.publicKey ? String(req.body.publicKey) : undefined;
       registerActiveIdentity(myId, myPublicKey);
 
-      if (!doesUserExistOrOnline(peerId)) {
+      const roomId = buildRoomId(myId, peerId);
+      const now = Date.now();
+      const cutoff = now - TTL_MS;
+
+      let roomObj = memoryRooms.get(roomId);
+      if (roomObj && roomObj.created_at < cutoff) {
+        memoryRooms.delete(roomId);
+        memoryMessages.delete(roomId);
+        roomObj = undefined;
+      }
+
+      const peerAlive = doesUserExistOrOnline(peerId);
+      if (!peerAlive && !roomObj) {
         res.status(404).json({
           ok: false,
           error: 'User not found. Please check the ID and try again.',
@@ -806,11 +819,6 @@ async function startServer() {
         return;
       }
 
-      const roomId = buildRoomId(myId, peerId);
-      const now = Date.now();
-      const cutoff = now - TTL_MS;
-
-      let roomObj = memoryRooms.get(roomId);
       const isNewRoom = !roomObj;
       if (!roomObj) {
         roomObj = { room_id: roomId, created_at: now };
@@ -833,7 +841,7 @@ async function startServer() {
         reactions: reactionsByMsg[String(row.id)] || {},
       }));
 
-      if (notifyPeer) {
+      if (notifyPeer && peerAlive) {
         sendToUser(peerId, {
           type: 'private:chat_request',
           roomId,
@@ -854,7 +862,7 @@ async function startServer() {
           expires_at: createdAt + TTL_MS,
           peer_id: peerId,
           peer_public_key: peerPublicKey,
-          peer_alive: true,
+          peer_alive: peerAlive,
         },
         messages,
       });

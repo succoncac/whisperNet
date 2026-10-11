@@ -638,7 +638,19 @@ export class WhisperNetHub {
       }
       this.registerIdentity(myId, myPublicKey);
 
-      if (!this.doesUserExistOrOnline(peerId)) {
+      const roomId = buildRoomId(myId, peerId);
+      const now = Date.now();
+      const cutoff = now - TTL_MS;
+
+      let roomObj = this.rooms.get(roomId);
+      if (roomObj && roomObj.created_at < cutoff) {
+        this.rooms.delete(roomId);
+        this.messages.delete(roomId);
+        roomObj = undefined;
+      }
+
+      const peerAlive = this.doesUserExistOrOnline(peerId);
+      if (!peerAlive && !roomObj) {
         return jsonResponse(
           { ok: false, error: 'User not found. Please check the ID and try again.' },
           404,
@@ -647,11 +659,6 @@ export class WhisperNetHub {
         );
       }
 
-      const roomId = buildRoomId(myId, peerId);
-      const now = Date.now();
-      const cutoff = now - TTL_MS;
-
-      let roomObj = this.rooms.get(roomId);
       const isNewRoom = !roomObj;
       if (!roomObj) {
         roomObj = { room_id: roomId, created_at: now };
@@ -674,7 +681,7 @@ export class WhisperNetHub {
         reactions: reactionsByMsg[String(r.id)] || {},
       }));
 
-      if (notifyPeer) {
+      if (notifyPeer && peerAlive) {
         this.sendToUser(peerId, {
           type: 'private:chat_request',
           roomId,
@@ -696,7 +703,7 @@ export class WhisperNetHub {
             expires_at: createdAt + TTL_MS,
             peer_id: peerId,
             peer_public_key: peerPublicKey,
-            peer_alive: true,
+            peer_alive: peerAlive,
           },
           messages,
         },
@@ -737,6 +744,7 @@ export class WhisperNetHub {
           room_id: roomId,
           peer_id: peerId,
           peer_public_key: this.getPeerPublicKey(peerId),
+          peer_alive: this.doesUserExistOrOnline(peerId),
           created_at: createdAt,
           expires_at: createdAt + TTL_MS,
           message_count: validMsgs.length,
