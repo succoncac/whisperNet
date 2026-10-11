@@ -495,21 +495,86 @@ async function startServer() {
     });
   });
 
-  // Register/Heartbeat User Identity + ECDH Public Key
+  const ID_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+  function generateRandomUserId(length: number): string {
+    let suffix = '';
+    for (let i = 0; i < length; i++) {
+      suffix += ID_CHARS[Math.floor(Math.random() * ID_CHARS.length)];
+    }
+    return `USER-${suffix}`;
+  }
+
+  async function isUserIdTakenByAnotherSession(candidateId: string): Promise<boolean> {
+    if (isUserCurrentlyOnline(candidateId)) {
+      return true;
+    }
+    const cutoff = Date.now() - TTL_MS;
+    const res = await db.execute({
+      sql: 'SELECT user_id FROM active_users WHERE user_id = ? AND last_seen >= ? LIMIT 1',
+      args: [candidateId, cutoff],
+    });
+    return res.rows.length > 0;
+  }
+
+  async function assignUniqueUserId(
+    requestedId?: string,
+    isExistingSession?: boolean
+  ): Promise<{ userId: string; collisionResolved: boolean }> {
+    const cleanRequested = normalizeCode(requestedId || '');
+    if (cleanRequested && /^USER-[A-Z0-9]{4,6}$/.test(cleanRequested)) {
+      if (isExistingSession) {
+        return { userId: cleanRequested, collisionResolved: false };
+      }
+      const taken = await isUserIdTakenByAnotherSession(cleanRequested);
+      if (!taken) {
+        return { userId: cleanRequested, collisionResolved: false };
+      }
+    }
+
+    // Dynamic length scaling: 4 chars -> 5 chars -> 6 chars on collision
+    const lengthsToTry = [4, 5, 6];
+    for (const len of lengthsToTry) {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const candidate = generateRandomUserId(len);
+        const taken = await isUserIdTakenByAnotherSession(candidate);
+        if (!taken) {
+          return {
+            userId: candidate,
+            collisionResolved: Boolean(cleanRequested && candidate !== cleanRequested),
+          };
+        }
+      }
+    }
+
+    const fallback6 = generateRandomUserId(6);
+    return { userId: fallback6, collisionResolved: true };
+  }
+
+  // Register/Heartbeat User Identity + Collision Check & Retry Scaling (4 -> 5 -> 6 chars)
   app.post('/api/users/register', async (req, res) => {
     try {
-      const userId = normalizeCode(req.body?.userId);
+      await cleanupExpiredData();
+      const requestedId = normalizeCode(req.body?.userId);
+      const isExistingSession = Boolean(req.body?.isExistingSession);
       const publicKey = req.body?.publicKey ? String(req.body.publicKey) : undefined;
-      if (!userId || userId.length < 4) {
-        res.status(400).json({ ok: false, error: 'Invalid User ID.' });
-        return;
-      }
+
+      const { userId, collisionResolved } = await assignUniqueUserId(
+        requestedId,
+        isExistingSession
+      );
+
       await registerActiveIdentity(userId, publicKey);
-      res.status(200).json({ ok: true, userId, timestamp: Date.now() });
-    } catch (error) {
+      res.status(200).json({
+        ok: true,
+        userId,
+        collisionResolved,
+        timestamp: Date.now(),
+      });
+    } catch {
       res.status(500).json({
         ok: false,
-        error: error instanceof Error ? error.message : 'Failed to register user session.',
+        error: 'Failed to register user session.',
       });
     }
   });

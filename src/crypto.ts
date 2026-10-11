@@ -9,16 +9,33 @@ const APP_CRYPTO_PEPPER = 'WHISPERNET-ZERO-TRACE-AES-256-GCM-PROTOCOL-2026';
 export interface StoredEcdhIdentity {
   publicKeyJwk: JsonWebKey;
   privateKeyJwk: JsonWebKey;
+  createdAt?: number;
 }
+
+const IDENTITY_TTL_MS = 24 * 60 * 60 * 1000;
 
 let cachedMyKeyPair: CryptoKeyPair | null = null;
 let cachedMyPublicJwkStr: string | null = null;
 const peerPublicKeyStore = new Map<string, string>();
 const derivedRoomKeyCache = new Map<string, CryptoKey>();
 
+export function resetMyEcdhIdentity(): void {
+  cachedMyKeyPair = null;
+  cachedMyPublicJwkStr = null;
+  derivedRoomKeyCache.clear();
+  try {
+    localStorage.removeItem(ECDH_IDENTITY_STORAGE_KEY);
+    sessionStorage.removeItem(ECDH_IDENTITY_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 function loadCachedPeerKeys(): void {
   try {
-    const raw = sessionStorage.getItem(PEER_PUBKEY_CACHE_KEY);
+    const raw =
+      localStorage.getItem(PEER_PUBKEY_CACHE_KEY) ||
+      sessionStorage.getItem(PEER_PUBKEY_CACHE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as Record<string, string>;
     for (const [uid, jwkStr] of Object.entries(parsed)) {
@@ -47,7 +64,9 @@ export function registerPeerPublicKey(peerId: string, publicKeyJwkStr?: string |
     for (const [k, v] of peerPublicKeyStore.entries()) {
       obj[k] = v;
     }
-    sessionStorage.setItem(PEER_PUBKEY_CACHE_KEY, JSON.stringify(obj));
+    const serialized = JSON.stringify(obj);
+    localStorage.setItem(PEER_PUBKEY_CACHE_KEY, serialized);
+    sessionStorage.setItem(PEER_PUBKEY_CACHE_KEY, serialized);
   } catch {
     // ignore
   }
@@ -62,26 +81,32 @@ export async function getOrCreateMyEcdhIdentity(): Promise<{
   }
 
   try {
-    const saved = sessionStorage.getItem(ECDH_IDENTITY_STORAGE_KEY);
+    const saved =
+      localStorage.getItem(ECDH_IDENTITY_STORAGE_KEY) ||
+      sessionStorage.getItem(ECDH_IDENTITY_STORAGE_KEY);
     if (saved) {
       const parsed: StoredEcdhIdentity = JSON.parse(saved);
-      const privateKey = await window.crypto.subtle.importKey(
-        'jwk',
-        parsed.privateKeyJwk,
-        { name: 'ECDH', namedCurve: 'P-256' },
-        true,
-        ['deriveBits']
-      );
-      const publicKey = await window.crypto.subtle.importKey(
-        'jwk',
-        parsed.publicKeyJwk,
-        { name: 'ECDH', namedCurve: 'P-256' },
-        true,
-        []
-      );
-      cachedMyKeyPair = { privateKey, publicKey };
-      cachedMyPublicJwkStr = JSON.stringify(parsed.publicKeyJwk);
-      return { keyPair: cachedMyKeyPair, publicKeyJwkString: cachedMyPublicJwkStr };
+      const isExpired =
+        parsed.createdAt && Date.now() - parsed.createdAt >= IDENTITY_TTL_MS;
+      if (!isExpired) {
+        const privateKey = await window.crypto.subtle.importKey(
+          'jwk',
+          parsed.privateKeyJwk,
+          { name: 'ECDH', namedCurve: 'P-256' },
+          true,
+          ['deriveBits']
+        );
+        const publicKey = await window.crypto.subtle.importKey(
+          'jwk',
+          parsed.publicKeyJwk,
+          { name: 'ECDH', namedCurve: 'P-256' },
+          true,
+          []
+        );
+        cachedMyKeyPair = { privateKey, publicKey };
+        cachedMyPublicJwkStr = JSON.stringify(parsed.publicKeyJwk);
+        return { keyPair: cachedMyKeyPair, publicKeyJwkString: cachedMyPublicJwkStr };
+      }
     }
   } catch {
     // Regenerate on parse/import error
@@ -98,10 +123,13 @@ export async function getOrCreateMyEcdhIdentity(): Promise<{
   const publicKeyJwkString = JSON.stringify(publicKeyJwk);
 
   try {
-    sessionStorage.setItem(
-      ECDH_IDENTITY_STORAGE_KEY,
-      JSON.stringify({ publicKeyJwk, privateKeyJwk })
-    );
+    const serialized = JSON.stringify({
+      publicKeyJwk,
+      privateKeyJwk,
+      createdAt: Date.now(),
+    });
+    localStorage.setItem(ECDH_IDENTITY_STORAGE_KEY, serialized);
+    sessionStorage.setItem(ECDH_IDENTITY_STORAGE_KEY, serialized);
   } catch {
     // ignore storage quota errors
   }

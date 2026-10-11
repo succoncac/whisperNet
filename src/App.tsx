@@ -15,8 +15,8 @@ import {
   Globe,
   Search,
   Users,
-  MessageSquareLock,
   Bell,
+  MessageSquareLock,
   SlidersHorizontal,
   Smile,
   Volume2,
@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import {
   getOrCreateMyEcdhIdentity,
+  resetMyEcdhIdentity,
   registerPeerPublicKey,
   encryptMessageContent,
   decryptMessageContent,
@@ -31,7 +32,7 @@ import {
 
 export type ReactionMap = Record<string, string[]>;
 
-export interface ChatMessage {
+interface ChatMessage {
   id: string;
   room_id: string;
   sender_id: string;
@@ -40,15 +41,15 @@ export interface ChatMessage {
   reactions?: ReactionMap;
 }
 
-export interface RoomMetadata {
+interface RoomMetadata {
   room_id: string;
   created_at: number;
   expires_at: number;
-  peer_id?: string;
+  peer_id: string;
   peer_public_key?: string | null;
 }
 
-export interface PrivateConversationSummary {
+interface PrivateConversationSummary {
   room_id: string;
   peer_id: string;
   peer_public_key?: string | null;
@@ -64,7 +65,7 @@ export interface PrivateConversationSummary {
   updated_at: number;
 }
 
-export interface IncomingNotificationToast {
+interface IncomingNotificationToast {
   id: string;
   fromUserId: string;
   roomId: string;
@@ -73,50 +74,73 @@ export interface IncomingNotificationToast {
   timestamp: number;
 }
 
-const SESSION_IDENTITY_KEY = 'whispernet_immutable_session_id';
-const SOUND_ENABLED_KEY = 'whispernet_sound_enabled';
-const TTL_MS = 24 * 60 * 60 * 1000;
-
-export interface EmojiCategory {
+interface EmojiCategory {
   id: string;
   name: string;
   icon: string;
   emojis: string[];
 }
 
-export const EMOJI_LIBRARY_CATEGORIES: EmojiCategory[] = [
+const TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_IDENTITY_KEY = 'whispernet_immutable_session_id_v1';
+const SESSION_IDENTITY_META_KEY = 'whispernet_identity_meta_v1';
+const SOUND_ENABLED_KEY = 'whispernet_sound_enabled_v1';
+
+interface StoredSessionIdentity {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+// Comprehensive Categorized Emoji Library (Emoji-Only)
+const EMOJI_LIBRARY_CATEGORIES: EmojiCategory[] = [
   {
     id: 'faces',
-    name: 'Expressive Faces & Emotions',
-    icon: '🥰',
+    name: 'Faces & Expressions',
+    icon: '😀',
     emojis: [
-      '🤟', '🥵', '😋', '🥰', '😏', '😣', '😀', '😃', '😄', '😁', '😆', '😅',
-      '😂', '🤣', '😭', '😉', '😗', '😙', '😚', '😘', '😍', '🤩', '🥳', '🙃',
-      '🙂', '🥲', '😊', '☺️', '😌', '😔', '🤪', '😜', '😝', '😛', '🤤', '🥺',
-      '🤭', '🥱', '😬', '😑', '🤗', '😱', '😐', '😶', '🤨', '🤐', '🧐', '🤔',
-      '😒', '🤫', '🙄', '😥', '😟', '😞', '🤬', '😡', '😠', '😤', '😢', '☹️',
-      '🙁', '😕', '😰', '😨', '😧', '😦', '😩', '😖', '🤯', '😳', '😲', '😯',
-      '😮', '😫', '😵', '🥴', '🥶', '🤢', '🤮', '😴', '🤠', '😇', '🤥', '😷',
-      '🤕', '🤒', '🤧', '😪', '🤑', '🤓', '🥸', '🤡', '💩', '😈', '👿',
+      '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
+      '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😗', '😙', '😚',
+      '😋', '😛', '😝', '😜', '🤪', '🤨', '🧐', '🤓', '😎', '🥸',
+      '🤩', '🥳', '😏', '😒', '😞', '😔', '😟', '😕', '🙁', '☹️',
+      '😣', '😖', '😫', '😩', '🥺', '😢', '😭', '😤', '😠', '😡',
+      '🤬', '🤯', '😳', '🥵', '🥶', '😱', '😨', '😰', '😥', '😓',
+      '🤗', '🤔', '🤭', '🤫', '🤥', '😶', '😐', '😑', '😬', '🙄',
+      '😯', '😦', '😧', '😮', '😲', '🥱', '😴', '🤤', '😪', '😵',
+      '🤐', '🥴', '🤢', '🤮', '🤧', '😷', '🤒', '🤕', '🤑', '🤠',
     ],
   },
   {
-    id: 'gestures',
-    name: 'Gestures & Hands',
-    icon: '🤌',
+    id: 'hands',
+    name: 'Hands & Gestures',
+    icon: '🤟',
     emojis: [
-      '✊', '🤘', '🤞', '🤚', '🤌', '🤏', '🖖', '🤜', '🦾', '👌', '✌️', '👈',
-      '🤝', '👆', '🤙', '🖐️', '✋', '🤳',
+      '👋', '🤚', '🖐️', '✋', '🖖', '👌', '🤌', '🤏', '✌️', '🤞',
+      '🤟', '🤘', '🤙', '👈', '👉', '👆', '🖕', '👇', '☝️', '👍',
+      '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '👐', '🤲', '🤝',
+      '🙏', '✍️', '💅', '🤳', '💪', '🦾', '🦵', '🦿', '🦶', '👀',
     ],
   },
   {
-    id: 'fantasy',
-    name: 'Magic, Fantasy & Cats',
+    id: 'creatures',
+    name: 'Creatures & Stealth',
     icon: '👻',
     emojis: [
-      '⛄', '☃️', '🌞', '🌝', '🌜', '🌛', '👹', '🤖', '☠️', '🌚', '👻', '👽',
-      '😺', '😸', '😹', '😻', '😼', '😽', '🙀', '😿', '⚡', '🌟', '💥', '💨',
-      '👣', '👤', '🩸',
+      '😈', '👿', '👹', '👺', '🤡', '💩', '👻', '💀', '☠️', '👽',
+      '👾', '🤖', '🎃', '😺', '😸', '😹', '😻', '😼', '😽', '🙀',
+      '😿', '😾', '🙈', '🙉', '🙊', '🦊', '🐺', '🦁', '🐯', '🐍',
+      '🦂', '🕷️', '🦇', '🦉', '🦅', '🦈', '🐙', '🐉', '🦖', '🦄',
+    ],
+  },
+  {
+    id: 'symbols',
+    name: 'Cyber & Symbols',
+    icon: '⚡',
+    emojis: [
+      '🔥', '⚡', '💥', '✨', '💫', '💦', '💨', '🕳️', '💣', '💬',
+      '👁️‍🗨️', '🗨️', '🗯️', '💭', '💤', '🔒', '🔓', '🔏', '🔐', '🔑',
+      '🗝️', '🛡️', '⚔️', '🗡️', '🔫', '🧨', '🔮', '🧿', '🪬', '☢️',
+      '☣️', '⚠️', '🚫', '✅', '❌', '❓', '❗', '💯', '🚀', '🛸',
     ],
   },
   {
@@ -136,32 +160,79 @@ const REACTION_BAR_EMOJIS = [
   '💥', '🤟', '🤌', '✌️', '🤝', '👌', '☠️',
 ];
 
-function getOrAssignSessionIdentity(): string {
+function generateFreshClientSideIdentity(): StoredSessionIdentity {
+  const now = Date.now();
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let randomPart = '';
+  const array = new Uint32Array(4);
+  window.crypto.getRandomValues(array);
+  for (let i = 0; i < 4; i++) {
+    randomPart += chars[array[i] % chars.length];
+  }
+  const newId = `USER-${randomPart}`;
+  const record: StoredSessionIdentity = {
+    id: newId,
+    createdAt: now,
+    expiresAt: now + TTL_MS,
+  };
   try {
-    const existing = sessionStorage.getItem(SESSION_IDENTITY_KEY);
-    if (existing && /^USER-[A-Z0-9]{4,6}$/.test(existing)) {
-      return existing;
-    }
-    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-    let randomPart = '';
-    const array = new Uint32Array(4);
-    window.crypto.getRandomValues(array);
-    for (let i = 0; i < 4; i++) {
-      randomPart += chars[array[i] % chars.length];
-    }
-    const newId = `USER-${randomPart}`;
+    const serialized = JSON.stringify(record);
+    localStorage.setItem(SESSION_IDENTITY_META_KEY, serialized);
+    sessionStorage.setItem(SESSION_IDENTITY_META_KEY, serialized);
+    localStorage.setItem(SESSION_IDENTITY_KEY, newId);
     sessionStorage.setItem(SESSION_IDENTITY_KEY, newId);
-    return newId;
+  } catch {
+    // ignore storage errors
+  }
+  return record;
+}
+
+function getInitialSessionIdentity(): {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+  isExisting: boolean;
+} {
+  const now = Date.now();
+  try {
+    const rawMeta =
+      localStorage.getItem(SESSION_IDENTITY_META_KEY) ||
+      sessionStorage.getItem(SESSION_IDENTITY_META_KEY);
+    if (rawMeta) {
+      const parsed = JSON.parse(rawMeta) as StoredSessionIdentity;
+      if (
+        parsed &&
+        typeof parsed.id === 'string' &&
+        /^USER-[A-Z0-9]{4,6}$/.test(parsed.id) &&
+        typeof parsed.expiresAt === 'number' &&
+        parsed.expiresAt > now
+      ) {
+        return {
+          id: parsed.id,
+          createdAt: parsed.createdAt || parsed.expiresAt - TTL_MS,
+          expiresAt: parsed.expiresAt,
+          isExisting: true,
+        };
+      }
+    }
+
+    const fresh = generateFreshClientSideIdentity();
+    return { ...fresh, isExisting: false };
   } catch {
     const fallback = `USER-${Math.floor(1000 + Math.random() * 9000)}`;
-    return fallback;
+    return {
+      id: fallback,
+      createdAt: now,
+      expiresAt: now + TTL_MS,
+      isExisting: false,
+    };
   }
 }
 
 function normalizeUserCode(raw: string): string {
   const cleaned = raw.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
   if (!cleaned) return '';
-  if (/^[0-9A-Z]{4}$/.test(cleaned)) {
+  if (/^[0-9A-Z]{4,6}$/.test(cleaned)) {
     return `USER-${cleaned}`;
   }
   return cleaned;
@@ -192,7 +263,10 @@ async function decryptMessageBatch(
 }
 
 export default function App() {
-  const [myId] = useState<string>(() => getOrAssignSessionIdentity());
+  const [initialIdentity] = useState(() => getInitialSessionIdentity());
+  const [myId, setMyId] = useState<string>(initialIdentity.id);
+  const [myIdExpiresAt, setMyIdExpiresAt] = useState<number>(initialIdentity.expiresAt);
+  const isExistingSessionRef = useRef<boolean>(initialIdentity.isExisting);
 
   // Navigation Tabs: 'global' (Global Chat) | 'private' (Private Chats)
   const [activeTab, setActiveTab] = useState<'global' | 'private'>('global');
@@ -376,18 +450,46 @@ export default function App() {
     []
   );
 
-  // Initialize Client-Side ECDH P-256 KeyPair & Register Public Key with Blind Relay
+  // Initialize Client-Side KeyPair & Register Identity with Backend Collision Check (4 -> 5 -> 6 chars)
   useEffect(() => {
     let active = true;
     (async () => {
       try {
         const { publicKeyJwkString } = await getOrCreateMyEcdhIdentity();
         if (!active) return;
-        await fetch('/api/users/register', {
+        const res = await fetch('/api/users/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId: myId, publicKey: publicKeyJwkString }),
+          body: JSON.stringify({
+            userId: myId,
+            isExistingSession: isExistingSessionRef.current,
+            publicKey: publicKeyJwkString,
+          }),
         });
+        const data = await res.json();
+        if (active && data?.ok && data.userId && data.userId !== myId) {
+          const now = Date.now();
+          const newExpiresAt = now + TTL_MS;
+          setMyId(data.userId);
+          setMyIdExpiresAt(newExpiresAt);
+          isExistingSessionRef.current = true;
+          try {
+            const record: StoredSessionIdentity = {
+              id: data.userId,
+              createdAt: now,
+              expiresAt: newExpiresAt,
+            };
+            const serialized = JSON.stringify(record);
+            localStorage.setItem(SESSION_IDENTITY_META_KEY, serialized);
+            sessionStorage.setItem(SESSION_IDENTITY_META_KEY, serialized);
+            localStorage.setItem(SESSION_IDENTITY_KEY, data.userId);
+            sessionStorage.setItem(SESSION_IDENTITY_KEY, data.userId);
+          } catch {
+            // ignore storage errors
+          }
+        } else if (active && data?.ok) {
+          isExistingSessionRef.current = true;
+        }
       } catch {
         // ignore
       }
@@ -449,6 +551,8 @@ export default function App() {
                   hasNewIncomingMessage = true;
                 }
               }
+            } else {
+              seenMessageIdsRef.current.add(conv.last_message.id);
             }
 
             return {
@@ -477,44 +581,68 @@ export default function App() {
     fetchConversations();
   }, [fetchGlobalMessages, fetchConversations]);
 
-  // 1-second ticker for live 24h TTL countdowns
+  // 1-second ticker for TTL Countdown & 24-Hour User Identity Expiration
   useEffect(() => {
     const timer = window.setInterval(() => {
-      setNowTick(Date.now());
+      const now = Date.now();
+      setNowTick(now);
+      if (now >= myIdExpiresAt) {
+        resetMyEcdhIdentity();
+        const rotated = generateFreshClientSideIdentity();
+        isExistingSessionRef.current = false;
+        setMyId(rotated.id);
+        setMyIdExpiresAt(rotated.expiresAt);
+        setActiveRoom(null);
+        setActivePeerId(null);
+        setPrivateMessages([]);
+        setConversations([]);
+      }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [myIdExpiresAt]);
 
-  // Auto-scroll when new messages arrive
+  // Auto-scroll Global Chat
   useEffect(() => {
     if (activeTab === 'global') {
       globalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [globalMessages.length, activeTab]);
+  }, [globalMessages, activeTab]);
 
+  // Auto-scroll Private Chat
   useEffect(() => {
     if (activeTab === 'private') {
       privateEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [privateMessages.length, peerTyping, activeTab]);
+  }, [privateMessages, peerTyping, activeTab]);
 
-  // Connect to a 1-on-1 Peer Channel with E2EE Handshake & Strict Validation
+  // Emoji Insertion Helper for Both Global and Private Chat
+  const handleInsertEmoji = (emoji: string) => {
+    if (pickerOpenFor === 'global') {
+      setGlobalDraft((prev) => `${prev}${emoji}`);
+      globalInputRef.current?.focus();
+    } else if (pickerOpenFor === 'private') {
+      setPrivateDraft((prev) => `${prev}${emoji}`);
+      privateInputRef.current?.focus();
+    }
+  };
+
+  // Connect to 1-on-1 Private Chat with Strict User Existence Validation & Public Key Exchange
   const connectToPeerChannel = useCallback(
-    async (targetRawCode: string, notifyRemote = true) => {
-      setErrorBanner(null);
-      setNukeAlert(null);
-
-      const targetPeer = normalizeUserCode(targetRawCode);
+    async (targetPeerRaw: string, notifyPeer = true) => {
+      const targetPeer = normalizeUserCode(targetPeerRaw);
       if (!targetPeer || !/^USER-[A-Z0-9]{4,8}$/.test(targetPeer)) {
         setErrorBanner('User not found. Please check the ID and try again.');
         return;
       }
       if (targetPeer === myId) {
-        setErrorBanner('You cannot initiate a 1-on-1 private chat with your own ID.');
+        setErrorBanner('User not found. Please check the ID and try again.');
         return;
       }
 
+      setErrorBanner(null);
+      setNukeAlert(null);
       setIsConnecting(true);
+
       try {
         const { publicKeyJwkString } = await getOrCreateMyEcdhIdentity();
         const res = await fetch('/api/rooms/connect', {
@@ -524,13 +652,14 @@ export default function App() {
             myId,
             peerId: targetPeer,
             publicKey: publicKeyJwkString,
-            notifyPeer: notifyRemote,
+            notifyPeer,
           }),
         });
         const data = await res.json();
 
         if (!res.ok || !data.ok) {
           setErrorBanner(data.error || 'User not found. Please check the ID and try again.');
+          setIsConnecting(false);
           return;
         }
 
@@ -539,14 +668,21 @@ export default function App() {
         }
 
         const rawMessages: ChatMessage[] = Array.isArray(data.messages) ? data.messages : [];
-        for (const m of rawMessages) {
-          seenMessageIdsRef.current.add(m.id);
-        }
+        rawMessages.forEach((m) => seenMessageIdsRef.current.add(m.id));
+
         const decryptedMessages = await decryptMessageBatch(
           rawMessages,
           data.room.room_id,
           targetPeer
         );
+
+        setActivePeerId(targetPeer);
+        setActiveRoom(data.room);
+        setPrivateMessages(decryptedMessages);
+        setActiveTab('private');
+        setPeerInput(targetPeer);
+        setShowMobileDrawer(false);
+        setPickerOpenFor(null);
 
         setUnreadByPeer((prev) => {
           if (!prev[targetPeer]) return prev;
@@ -554,15 +690,8 @@ export default function App() {
           delete next[targetPeer];
           return next;
         });
-        setToastQueue((prev) => prev.filter((t) => t.fromUserId !== targetPeer));
 
-        setActivePeerId(targetPeer);
-        setActiveRoom(data.room);
-        setPrivateMessages(decryptedMessages);
-        setPeerInput('');
-        setActiveTab('private');
-        setShowMobileDrawer(false);
-        setPickerOpenFor(null);
+        setToastQueue((prev) => prev.filter((t) => t.fromUserId !== targetPeer));
 
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(
@@ -574,6 +703,7 @@ export default function App() {
             })
           );
         }
+
         fetchConversations();
       } catch {
         setErrorBanner('User not found. Please check the ID and try again.');
@@ -584,20 +714,7 @@ export default function App() {
     [myId, fetchConversations]
   );
 
-  // Check URL query parameter ?peer=USER-XXXX on initial load
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const peerParam = params.get('peer');
-    if (peerParam) {
-      const normalized = normalizeUserCode(peerParam);
-      if (normalized && normalized !== myId) {
-        setPeerInput(normalized);
-        connectToPeerChannel(normalized, true);
-      }
-    }
-  }, [myId, connectToPeerChannel]);
-
-  // WebSocket setup with auto-reconnect, E2EE client decryption, reactions, & Web Audio ping
+  // Persistent WebSocket Connection for Real-Time Chat, Reactions & Notifications
   useEffect(() => {
     let isMounted = true;
     let reconnectTimer: number | null = null;
@@ -611,28 +728,23 @@ export default function App() {
 
       ws.onopen = async () => {
         if (!isMounted) return;
-        try {
-          const { publicKeyJwkString } = await getOrCreateMyEcdhIdentity();
-          if (ws.readyState !== WebSocket.OPEN) return;
+        const { publicKeyJwkString } = await getOrCreateMyEcdhIdentity();
+        ws.send(
+          JSON.stringify({
+            type: 'user:identify',
+            userId: myId,
+            publicKey: publicKeyJwkString,
+          })
+        );
+        if (activeRoomIdRef.current) {
           ws.send(
             JSON.stringify({
-              type: 'user:identify',
+              type: 'room:join',
+              roomId: activeRoomIdRef.current,
               userId: myId,
               publicKey: publicKeyJwkString,
             })
           );
-          if (activeRoomIdRef.current) {
-            ws.send(
-              JSON.stringify({
-                type: 'room:join',
-                roomId: activeRoomIdRef.current,
-                userId: myId,
-                publicKey: publicKeyJwkString,
-              })
-            );
-          }
-        } catch {
-          // ignore
         }
       };
 
@@ -641,159 +753,189 @@ export default function App() {
         try {
           const payload = JSON.parse(event.data);
 
-          if (payload.type === 'global:message:created') {
-            const rawMsg: ChatMessage = payload.message;
-            const plainContent = await decryptMessageContent(rawMsg.content, 'GLOBAL');
-            const decryptedMsg: ChatMessage = { ...rawMsg, content: plainContent };
-            setGlobalMessages((prev) => {
-              if (prev.some((m) => m.id === decryptedMsg.id)) return prev;
-              return [...prev, decryptedMsg].sort((a, b) => a.timestamp - b.timestamp);
-            });
-          } else if (payload.type === 'global:presence') {
-            if (Array.isArray(payload.users)) {
-              setOnlineUsers(payload.users);
-            }
-          } else if (payload.type === 'message:reaction_updated') {
-            const targetMsgId = String(payload.messageId || '');
-            const targetRoomId = String(payload.roomId || '');
-            const updatedReactions: ReactionMap = payload.reactions || {};
+          // 1. Global Presence Update
+          if (payload.type === 'global:presence' && Array.isArray(payload.users)) {
+            setOnlineUsers(payload.users);
+          }
 
-            if (targetRoomId === 'GLOBAL') {
+          // 2. Global Public Message Created
+          else if (payload.type === 'global:message:created' && payload.message) {
+            const incomingRaw: ChatMessage = payload.message;
+            const plainText = await decryptMessageContent(incomingRaw.content, 'GLOBAL');
+            const incoming: ChatMessage = { ...incomingRaw, content: plainText };
+
+            setGlobalMessages((prev) => {
+              if (prev.some((m) => m.id === incoming.id)) return prev;
+              return [...prev, incoming];
+            });
+          }
+
+          // 3. Emoji Reaction Updated in Real-Time
+          else if (
+            payload.type === 'message:reaction_updated' &&
+            payload.messageId &&
+            payload.reactions
+          ) {
+            const updatedMsgId = String(payload.messageId);
+            const updatedRoomId = String(payload.roomId);
+            const updatedReactions: ReactionMap = payload.reactions;
+
+            if (updatedRoomId === 'GLOBAL') {
               setGlobalMessages((prev) =>
                 prev.map((m) =>
-                  m.id === targetMsgId ? { ...m, reactions: updatedReactions } : m
+                  m.id === updatedMsgId ? { ...m, reactions: updatedReactions } : m
                 )
               );
-            } else if (targetRoomId === activeRoomIdRef.current) {
+            } else {
               setPrivateMessages((prev) =>
                 prev.map((m) =>
-                  m.id === targetMsgId ? { ...m, reactions: updatedReactions } : m
+                  m.id === updatedMsgId ? { ...m, reactions: updatedReactions } : m
                 )
               );
             }
-          } else if (payload.type === 'private:chat_request') {
-            const fromUser = String(payload.fromUserId || '');
-            const roomId = String(payload.roomId || '');
-            if (payload.fromPublicKey && fromUser) {
-              registerPeerPublicKey(fromUser, String(payload.fromPublicKey));
+          }
+
+          // 4. Incoming Private Chat Request Notification
+          else if (payload.type === 'private:chat_request' && payload.fromUserId) {
+            const senderId = String(payload.fromUserId);
+            if (payload.fromPublicKey) {
+              registerPeerPublicKey(senderId, String(payload.fromPublicKey));
             }
-            if (fromUser && fromUser !== myId) {
+            const roomId = String(payload.roomId);
+            fetchConversations();
+
+            const isAlreadyViewingThisPeer =
+              activeTabRef.current === 'private' && activePeerIdRef.current === senderId;
+
+            if (!isAlreadyViewingThisPeer) {
+              setUnreadByPeer((prev) => ({
+                ...prev,
+                [senderId]: (prev[senderId] || 0) + 1,
+              }));
               playNotificationPing('request');
-              const isViewingThisPeer =
-                activeTabRef.current === 'private' && activePeerIdRef.current === fromUser;
-              if (!isViewingThisPeer) {
-                setUnreadByPeer((prev) => ({
-                  ...prev,
-                  [fromUser]: (prev[fromUser] || 0) + 1,
-                }));
-                pushNotificationToast(
-                  fromUser,
-                  roomId,
-                  `${fromUser} wants to chat with you`,
-                  'Tap Open Chat to join this E2EE zero-trace private room.'
-                );
-              }
-              fetchConversations();
-            }
-          } else if (payload.type === 'private:message_notification') {
-            const fromUser = String(payload.fromUserId || '');
-            const roomId = String(payload.roomId || '');
-            const incomingMsg: ChatMessage | undefined = payload.message;
-            if (payload.fromPublicKey && fromUser) {
-              registerPeerPublicKey(fromUser, String(payload.fromPublicKey));
-            }
-
-            if (fromUser && fromUser !== myId && incomingMsg) {
-              const alreadySeen = seenMessageIdsRef.current.has(incomingMsg.id);
-              seenMessageIdsRef.current.add(incomingMsg.id);
-              if (!alreadySeen) {
-                playNotificationPing('message');
-              }
-
-              const plainText = await decryptMessageContent(
-                incomingMsg.content,
+              pushNotificationToast(
+                senderId,
                 roomId,
-                fromUser
+                `${senderId} opened a 1-on-1 chat with you`,
+                'Click "Open Chat" to enter the private tunnel.'
               );
-              const decryptedMsg: ChatMessage = { ...incomingMsg, content: plainText };
-
-              const isViewingThisPeer =
-                activeTabRef.current === 'private' && activePeerIdRef.current === fromUser;
-
-              if (isViewingThisPeer && activeRoomIdRef.current === roomId) {
-                setPrivateMessages((prev) => {
-                  if (prev.some((m) => m.id === decryptedMsg.id)) return prev;
-                  return [...prev, decryptedMsg].sort((a, b) => a.timestamp - b.timestamp);
-                });
-              } else {
-                setUnreadByPeer((prev) => ({
-                  ...prev,
-                  [fromUser]: (prev[fromUser] || 0) + 1,
-                }));
-                pushNotificationToast(
-                  fromUser,
-                  roomId,
-                  `New private message from ${fromUser}`,
-                  plainText.length > 65 ? `${plainText.slice(0, 65)}...` : plainText
-                );
-              }
-              fetchConversations();
             }
-          } else if (
-            payload.type === 'message:created' &&
-            payload.roomId === activeRoomIdRef.current
+          }
+
+          // 5. Incoming Direct Private Message Notification
+          else if (
+            payload.type === 'private:message_notification' &&
+            payload.message &&
+            payload.fromUserId
           ) {
-            const rawIncoming: ChatMessage = payload.message;
-            const alreadySeen = seenMessageIdsRef.current.has(rawIncoming.id);
-            seenMessageIdsRef.current.add(rawIncoming.id);
-            if (!alreadySeen && rawIncoming.sender_id !== myId) {
+            const senderId = String(payload.fromUserId);
+            if (payload.fromPublicKey) {
+              registerPeerPublicKey(senderId, String(payload.fromPublicKey));
+            }
+            const roomId = String(payload.roomId);
+            const incomingMsgRaw: ChatMessage = payload.message;
+            seenMessageIdsRef.current.add(incomingMsgRaw.id);
+
+            const decryptedText = await decryptMessageContent(
+              incomingMsgRaw.content,
+              roomId,
+              senderId
+            );
+            const incomingMsg: ChatMessage = {
+              ...incomingMsgRaw,
+              content: decryptedText,
+            };
+
+            fetchConversations();
+
+            if (activeRoomIdRef.current === roomId) {
+              setPrivateMessages((prev) => {
+                if (prev.some((m) => m.id === incomingMsg.id)) return prev;
+                return [...prev, incomingMsg];
+              });
+            }
+
+            const isCurrentlyViewingThisRoom =
+              activeTabRef.current === 'private' && activeRoomIdRef.current === roomId;
+
+            if (!isCurrentlyViewingThisRoom) {
+              setUnreadByPeer((prev) => ({
+                ...prev,
+                [senderId]: (prev[senderId] || 0) + 1,
+              }));
+              playNotificationPing('message');
+              pushNotificationToast(
+                senderId,
+                roomId,
+                `New private message from ${senderId}`,
+                decryptedText
+              );
+            } else {
               playNotificationPing('message');
             }
-            const plainText = await decryptMessageContent(
-              rawIncoming.content,
-              rawIncoming.room_id,
-              activePeerIdRef.current || undefined
-            );
-            const decryptedMsg: ChatMessage = { ...rawIncoming, content: plainText };
-            setPrivateMessages((prev) => {
-              if (prev.some((m) => m.id === decryptedMsg.id)) return prev;
-              return [...prev, decryptedMsg].sort((a, b) => a.timestamp - b.timestamp);
-            });
-            setPeerTyping(false);
-            fetchConversations();
-          } else if (payload.type === 'room:nuked') {
-            const nukedRoomId = String(payload.roomId || '');
-            const actor = payload.triggeredBy === myId ? 'You' : payload.triggeredBy;
+          }
 
-            if (nukedRoomId === activeRoomIdRef.current) {
+          // 6. Active Private Room Presence
+          else if (
+            payload.type === 'room:presence' &&
+            payload.roomId === activeRoomIdRef.current
+          ) {
+            const participants: string[] = payload.participants || [];
+            const otherOnline = participants.some((u) => u !== myId);
+            setPeerOnline(otherOnline);
+          }
+
+          // 7. Active Private Room Message Broadcast
+          else if (
+            payload.type === 'message:created' &&
+            payload.roomId === activeRoomIdRef.current &&
+            payload.message
+          ) {
+            const incomingRaw: ChatMessage = payload.message;
+            seenMessageIdsRef.current.add(incomingRaw.id);
+
+            const plainText = await decryptMessageContent(
+              incomingRaw.content,
+              incomingRaw.room_id,
+              activePeerIdRef.current || incomingRaw.sender_id
+            );
+            const incoming: ChatMessage = { ...incomingRaw, content: plainText };
+
+            setPrivateMessages((prev) => {
+              if (prev.some((m) => m.id === incoming.id)) return prev;
+              return [...prev, incoming];
+            });
+            if (incoming.sender_id !== myId) {
+              setPeerTyping(false);
+            }
+          }
+
+          // 8. Typing Indicator
+          else if (
+            payload.type === 'room:typing' &&
+            payload.roomId === activeRoomIdRef.current &&
+            payload.userId !== myId
+          ) {
+            setPeerTyping(Boolean(payload.isTyping));
+          }
+
+          // 9. Instant Room Nuke Event
+          else if (payload.type === 'room:nuked' && payload.roomId) {
+            const nukedId = String(payload.roomId);
+            fetchConversations();
+
+            if (nukedId === activeRoomIdRef.current) {
               setPrivateMessages([]);
               setActiveRoom(null);
               setActivePeerId(null);
               setShowNukeModal(false);
-            }
-            setNukeAlert(
-              `ZERO-TRACE NUKE EXECUTED (${actor}): Private room (${nukedRoomId}) and all E2EE ciphertexts were permanently wiped.`
-            );
-            fetchConversations();
-          } else if (
-            payload.type === 'room:presence' &&
-            payload.roomId === activeRoomIdRef.current
-          ) {
-            const participants: string[] = Array.isArray(payload.participants)
-              ? payload.participants
-              : [];
-            const others = participants.filter((u) => u !== myId);
-            setPeerOnline(others.length > 0);
-          } else if (
-            payload.type === 'room:typing' &&
-            payload.roomId === activeRoomIdRef.current
-          ) {
-            if (payload.userId !== myId) {
-              setPeerTyping(Boolean(payload.isTyping));
+              setNukeAlert(
+                `NUKE EXECUTED: Room ${nukedId} and all messages were permanently wiped by ${payload.triggeredBy || 'peer'}.`
+              );
             }
           }
         } catch {
-          // Ignore invalid JSON
+          // Ignore malformed WS packets
         }
       };
 
@@ -815,7 +957,7 @@ export default function App() {
     };
   }, [myId, fetchConversations, pushNotificationToast, playNotificationPing]);
 
-  // Fallback Polling for Global, Conversations & Private Chat (every 3.5s) with Client Decryption
+  // Fallback Polling for Global, Conversations & Private Chat (every 3.5s)
   useEffect(() => {
     const pollInterval = window.setInterval(async () => {
       fetchGlobalMessages();
@@ -834,7 +976,7 @@ export default function App() {
             setActiveRoom(null);
             setActivePeerId(null);
             setNukeAlert(
-              'CHANNEL TERMINATED: Private room and all E2EE ciphertexts were permanently purged.'
+              'CHANNEL TERMINATED: Private room and all messages were permanently purged.'
             );
             fetchConversations();
             return;
@@ -955,7 +1097,7 @@ export default function App() {
     }
   };
 
-  // Encrypt & Transmit Global Public Content via Web Crypto API (AES-GCM)
+  // Transmit Global Public Content
   const sendGlobalContent = async (rawContent: string) => {
     const text = rawContent.trim();
     if (!text || isSendingGlobal) return;
@@ -974,7 +1116,6 @@ export default function App() {
     setIsSendingGlobal(true);
 
     try {
-      // Encrypt on the sender's browser before sending to blind server relay
       const encryptedCiphertext = await encryptMessageContent(text, 'GLOBAL');
 
       const res = await fetch('/api/global/messages', {
@@ -1008,7 +1149,7 @@ export default function App() {
     await sendGlobalContent(text);
   };
 
-  // Encrypt & Transmit Private 1-on-1 Content via Web Crypto API (AES-256-GCM E2EE)
+  // Transmit Private 1-on-1 Content (Encrypted Under the Hood)
   const sendPrivateContent = async (rawContent: string) => {
     if (!activeRoom || isSendingPrivate) return;
     const text = rawContent.trim();
@@ -1040,7 +1181,6 @@ export default function App() {
     }
 
     try {
-      // Strictly encrypt on the client browser using AES-256-GCM before network transmission
       const encryptedCiphertext = await encryptMessageContent(
         text,
         activeRoom.room_id,
@@ -1059,7 +1199,7 @@ export default function App() {
       const data = await res.json();
       if (!res.ok || !data.ok) {
         setPrivateMessages((prev) => prev.filter((m) => m.id !== tempId));
-        setErrorBanner(data.error || 'Failed to deliver private message.');
+        setErrorBanner(data.error || 'Failed to send private message.');
       } else {
         fetchConversations();
       }
@@ -1080,19 +1220,6 @@ export default function App() {
     await sendPrivateContent(text);
   };
 
-  // Insert an Emoji into the active input field
-  const handleInsertEmoji = (emoji: string) => {
-    if (pickerOpenFor === 'global') {
-      setGlobalDraft((prev) => `${prev}${emoji}`);
-      globalInputRef.current?.focus();
-    } else if (pickerOpenFor === 'private') {
-      const nextVal = `${privateDraft}${emoji}`;
-      handlePrivateDraftChange(nextVal);
-      privateInputRef.current?.focus();
-    }
-  };
-
-  // Broadcast typing state in private chat
   const handlePrivateDraftChange = (val: string) => {
     setPrivateDraft(val);
     if (!activeRoom || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -1156,7 +1283,7 @@ export default function App() {
       setActivePeerId(null);
       setShowNukeModal(false);
       setNukeAlert(
-        `NUKE COMPLETE: Permanently wiped ${data.deletedMessages} encrypted messages and room history (${data.nukedRoomId}) for both participants.`
+        `NUKE COMPLETE: Permanently wiped ${data.deletedMessages} messages and room history (${data.nukedRoomId}) for both participants.`
       );
       fetchConversations();
     } catch {
@@ -1180,6 +1307,7 @@ export default function App() {
   const roomRemainingMs = activeRoom
     ? Math.max(0, activeRoom.created_at + TTL_MS - nowTick)
     : TTL_MS;
+  const myIdRemainingMs = Math.max(0, myIdExpiresAt - nowTick);
 
   const activeEmojiCategory =
     EMOJI_LIBRARY_CATEGORIES.find((c) => c.id === selectedCategoryId) ||
@@ -1190,6 +1318,7 @@ export default function App() {
     const isMine = msg.sender_id === myId;
     const msgRemainingMs = Math.max(0, msg.timestamp + TTL_MS - nowTick);
     const reactionsMap: ReactionMap = msg.reactions || {};
+
     // Group identical emojis and deduplicate user list per emoji
     const groupedReactions = Object.entries(reactionsMap)
       .map(([emoji, users]) => {
@@ -1341,7 +1470,7 @@ export default function App() {
         </div>
 
         {/* Category Tabs for Emojis */}
-        <div className="px-2.5 py-1.5 border-b border-zinc-800/60 flex items-center gap-1 overflow-x-auto shrink-0 bg-zinc-950">
+        <div className="px-2.5 py-1.5 border-b border-zinc-800/60 flex items-center gap-1 overflow-x-auto scrollbar-none shrink-0 bg-zinc-950">
           {EMOJI_LIBRARY_CATEGORIES.map((cat) => {
             const active = cat.id === selectedCategoryId;
             return (
@@ -1389,39 +1518,35 @@ export default function App() {
   const sidebarContent = (
     <div className="flex flex-col justify-between h-full gap-5 select-none">
       <div className="space-y-5">
-        {/* 1. Immutable Random Identity Card */}
+        {/* 1. Immutable Random Identity Card (24-Hour Active Lifecycle) */}
         <div className="space-y-1.5">
           <div className="flex items-center justify-between text-xs text-zinc-400">
-            <span>Your Immutable Identity</span>
-            <span>·</span>
-            <span className="font-mono text-emerald-400">AES-256-GCM E2EE</span>
+            <span>Your Identity</span>
+            <span className="font-mono text-[11px] text-emerald-400 tabular-nums">
+              TTL: {formatCountdown(myIdRemainingMs)}
+            </span>
           </div>
-          <div className="p-3.5 bg-zinc-900/60 border border-zinc-800 rounded-xl space-y-2.5 backdrop-blur-sm">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-base sm:text-lg font-mono font-semibold tracking-wider text-zinc-100 tabular-nums truncate">
-                {myId}
-              </span>
-              <button
-                type="button"
-                onClick={copyMyId}
-                className="px-2.5 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-              >
-                {copiedId ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copy ID</span>
-                  </>
-                )}
-              </button>
-            </div>
-            <p className="text-xs text-zinc-400 leading-relaxed">
-              Messages are encrypted in your browser via Web Crypto API before transmission.
-            </p>
+          <div className="p-3 bg-zinc-900/60 border border-zinc-800 rounded-xl flex items-center justify-between gap-2 backdrop-blur-sm">
+            <span className="text-base sm:text-lg font-mono font-semibold tracking-wider text-zinc-100 tabular-nums truncate">
+              {myId}
+            </span>
+            <button
+              type="button"
+              onClick={copyMyId}
+              className="px-2.5 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+            >
+              {copiedId ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copy ID</span>
+                </>
+              )}
+            </button>
           </div>
         </div>
 
@@ -1432,7 +1557,7 @@ export default function App() {
             className="block text-xs font-medium text-zinc-300 flex items-center gap-1.5"
           >
             <Search className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-            <span>Manual ID Search</span>
+            <span>Connect Peer ID</span>
           </label>
           <div className="flex gap-2 w-full">
             <input
@@ -1440,7 +1565,7 @@ export default function App() {
               type="text"
               value={peerInput}
               onChange={(e) => setPeerInput(e.target.value.toUpperCase())}
-              placeholder="Enter ID (e.g. USER-4892)"
+              placeholder="USER-5LPT"
               maxLength={16}
               className="select-text min-w-0 flex-1 px-3 py-2 text-xs sm:text-sm font-mono bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500 transition-colors uppercase"
             />
@@ -1453,9 +1578,6 @@ export default function App() {
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
-          <p className="text-[11px] text-zinc-500">
-            Validates active ID and establishes an E2EE 1-on-1 tunnel.
-          </p>
         </form>
 
         {/* 3. Active Private Chats & Incoming Requests Section */}
@@ -1523,7 +1645,7 @@ export default function App() {
                     <p className="text-[11px] text-zinc-400 truncate">
                       {conv.last_message
                         ? `${conv.last_message.sender_id === myId ? 'You: ' : ''}${conv.last_message.content}`
-                        : 'E2EE session initialized — tap to open'}
+                        : 'Private channel ready — tap to open'}
                     </p>
                   </button>
                 );
@@ -1537,7 +1659,7 @@ export default function App() {
           <div className="flex items-center justify-between text-xs text-zinc-400">
             <span className="flex items-center gap-1.5">
               <Users className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <span>Online Identities</span>
+              <span>Online Peers</span>
             </span>
             <span className="font-mono text-[11px] tabular-nums">{onlineUsers.length} online</span>
           </div>
@@ -1571,32 +1693,28 @@ export default function App() {
         </div>
       </div>
 
-      {/* Zero-Trace Sound Notification & E2EE Status Footer */}
-      <div className="pt-3 border-t border-zinc-800/80 space-y-2 text-xs text-zinc-400 shrink-0">
-        <div className="flex items-center justify-between">
-          <span className="font-medium text-zinc-300">Web Crypto AES-256-GCM</span>
-          <span className="font-mono text-emerald-400">24h Auto-Destruct</span>
-        </div>
-        <div className="flex items-center justify-between pt-0.5">
-          <button
-            type="button"
-            onClick={toggleSoundEnabled}
-            className="w-full py-2 px-3 rounded-lg bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center justify-between transition-colors cursor-pointer"
-            title="Toggle Web Audio notification ping sound"
-          >
-            <span className="flex items-center gap-2">
-              {soundEnabled ? (
-                <Volume2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              ) : (
-                <VolumeX className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-              )}
-              <span>Notification Sound Ping</span>
-            </span>
-            <span className={`font-mono text-[11px] ${soundEnabled ? 'text-emerald-400' : 'text-zinc-500'}`}>
-              {soundEnabled ? 'ON' : 'MUTED'}
-            </span>
-          </button>
-        </div>
+      {/* Minimalist TTL Indicator & Compact Sound Icon Toggle */}
+      <div className="pt-2.5 border-t border-zinc-800/80 flex items-center justify-between gap-2 text-xs text-zinc-400 shrink-0">
+        <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-zinc-400">
+          <Clock className="w-3 h-3 text-emerald-400 shrink-0" />
+          <span>24h Auto-Destruct</span>
+        </span>
+        <button
+          type="button"
+          onClick={toggleSoundEnabled}
+          className="px-2 py-1 rounded-md bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-[11px] font-mono flex items-center gap-1 transition-colors cursor-pointer shrink-0"
+          title="Toggle notification sound"
+          aria-label="Toggle notification sound"
+        >
+          {soundEnabled ? (
+            <Volume2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+          ) : (
+            <VolumeX className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+          )}
+          <span className={soundEnabled ? 'text-emerald-400' : 'text-zinc-500'}>
+            {soundEnabled ? 'ON' : 'OFF'}
+          </span>
+        </button>
       </div>
     </div>
   );
@@ -1612,8 +1730,8 @@ export default function App() {
         e.preventDefault();
       }}
     >
-      {/* Streamlined Top Header: ONLY App Title ("WhisperNet") and User ID Copy Button */}
-      <header className="shrink-0 w-full max-w-full flex items-center justify-between gap-4 px-3.5 sm:px-6 py-2.5 sm:py-3 border-b border-zinc-800/80 bg-black/95 backdrop-blur-md z-30 select-none">
+      {/* Streamlined Top Header: App Title ("WhisperNet"), Tiny Sound Icon Toggle, and User ID Copy Button */}
+      <header className="shrink-0 w-full max-w-full flex items-center justify-between gap-3 px-3.5 sm:px-6 py-2.5 sm:py-3 border-b border-zinc-800/80 bg-black/95 backdrop-blur-md z-30 select-none">
         <a
           href="#global"
           onClick={(e) => {
@@ -1626,12 +1744,29 @@ export default function App() {
           WhisperNet
         </a>
 
-        <div className="flex items-center shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={toggleSoundEnabled}
+            className="px-2 py-1.5 rounded-lg bg-zinc-900/90 hover:bg-zinc-900 border border-zinc-800 text-[11px] font-mono flex items-center gap-1 transition-colors cursor-pointer shrink-0"
+            title={soundEnabled ? 'Sound notifications ON' : 'Sound notifications OFF'}
+            aria-label="Toggle notification sound"
+          >
+            {soundEnabled ? (
+              <Volume2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+            ) : (
+              <VolumeX className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+            )}
+            <span className={`text-[10px] ${soundEnabled ? 'text-emerald-400' : 'text-zinc-500'}`}>
+              {soundEnabled ? 'ON' : 'OFF'}
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={copyMyId}
             className="px-2.5 sm:px-3.5 py-1.5 text-xs font-mono font-medium text-zinc-200 bg-zinc-900/90 border border-zinc-800 rounded-lg hover:border-emerald-500/50 hover:bg-zinc-900 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer select-none"
-            title="Click to copy your immutable ID"
+            title="Click to copy your ID"
           >
             <span>{myId}</span>
             {copiedId ? (
@@ -1705,7 +1840,7 @@ export default function App() {
             <div className="relative z-10 w-full max-w-xs bg-zinc-950 border-r border-zinc-800 h-full flex flex-col p-4 overflow-y-auto touch-scroll shadow-2xl">
               <div className="flex items-center justify-between pb-3 mb-3 border-b border-zinc-800 shrink-0">
                 <span className="text-xs font-bold uppercase tracking-wider text-zinc-300">
-                  Identity & Peer Directory
+                  Peer Directory
                 </span>
                 <button
                   type="button"
@@ -1770,7 +1905,7 @@ export default function App() {
 
             <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
               <span className="hidden md:inline text-[11px] font-mono text-zinc-400">
-                {onlineUsers.length} online · E2EE · TTL: 24h
+                {onlineUsers.length} online · TTL: 24h
               </span>
               <button
                 type="button"
@@ -1837,7 +1972,7 @@ export default function App() {
                     type="text"
                     value={peerInput}
                     onChange={(e) => setPeerInput(e.target.value.toUpperCase())}
-                    placeholder="Connect Peer ID (e.g. USER-4892)"
+                    placeholder="Connect Peer ID (e.g. USER-5LPT)"
                     maxLength={16}
                     className="select-text min-w-0 flex-1 px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 uppercase"
                   />
@@ -1884,8 +2019,8 @@ export default function App() {
                       ? 'bg-zinc-800 border-emerald-500/60 text-emerald-400'
                       : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                   }`}
-                  title="Open Extensive Emoji Picker"
-                  aria-label="Open Extensive Emoji Picker"
+                  title="Open Emoji Picker"
+                  aria-label="Open Emoji Picker"
                 >
                   <Smile className="w-4 h-4" />
                 </button>
@@ -1922,7 +2057,7 @@ export default function App() {
                     </div>
                     <div className="space-y-1.5">
                       <h2 className="text-lg sm:text-2xl font-bold tracking-tight text-zinc-100">
-                        End-to-End Encrypted 1-on-1 Chats
+                        Private 1-on-1 Channels
                       </h2>
                       <p className="text-xs sm:text-sm text-zinc-400 leading-relaxed">
                         Enter an active peer ID below, select an ongoing conversation, or tap any user ID in <strong className="text-zinc-200">Global Chat</strong>.
@@ -1938,7 +2073,7 @@ export default function App() {
                         type="text"
                         value={peerInput}
                         onChange={(e) => setPeerInput(e.target.value.toUpperCase())}
-                        placeholder="Enter Peer ID (e.g. USER-4892)"
+                        placeholder="Enter Peer ID (e.g. USER-5LPT)"
                         maxLength={16}
                         className="select-text min-w-0 flex-1 px-3 py-2 text-xs sm:text-sm font-mono bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500 uppercase"
                       />
@@ -1993,7 +2128,7 @@ export default function App() {
                                 <p className="text-xs text-zinc-300 truncate">
                                   {conv.last_message
                                     ? conv.last_message.content
-                                    : `${conv.peer_id} initiated an E2EE private session`}
+                                    : `${conv.peer_id} initiated a private session`}
                                 </p>
                               </button>
                             );
@@ -2002,41 +2137,22 @@ export default function App() {
                       </div>
                     )}
 
-                    <div className="w-full grid grid-cols-1 sm:grid-cols-3 gap-3 text-left pt-2">
-                      <div className="p-3.5 bg-zinc-900/40 border border-zinc-800/80 rounded-xl space-y-1">
-                        <div className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
-                          <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                          <span>Client-Side AES-GCM</span>
-                        </div>
-                        <p className="text-xs text-zinc-400">
-                          Messages are encrypted in your browser before reaching the blind Worker relay.
-                        </p>
-                      </div>
-                      <div className="p-3.5 bg-zinc-900/40 border border-zinc-800/80 rounded-xl space-y-1">
-                        <div className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
-                          <Flame className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                          <span>Instant Nuke</span>
-                        </div>
-                        <p className="text-xs text-zinc-400">
-                          "Nuke Chat" wipes all encrypted ciphertexts and room history for both peers.
-                        </p>
-                      </div>
-                      <div className="p-3.5 bg-zinc-900/40 border border-zinc-800/80 rounded-xl space-y-1">
-                        <div className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
-                          <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                          <span>24-Hour TTL</span>
-                        </div>
-                        <p className="text-xs text-zinc-400">
-                          Automatic zero-trace purge removes any un-nuked ciphertexts after 24 hours.
-                        </p>
-                      </div>
+                    <div className="flex items-center justify-center flex-wrap gap-2 pt-1">
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-zinc-900/70 border border-zinc-800 text-xs text-zinc-300">
+                        <Flame className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                        <span>Instant Nuke</span>
+                      </span>
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-zinc-900/70 border border-zinc-800 text-xs text-zinc-300">
+                        <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span>24h TTL</span>
+                      </span>
                     </div>
                   </div>
                 </div>
               ) : (
                 /* Active Private 1-on-1 Room: Fixed Room Header + Scrollable Messages + Fixed Input */
                 <>
-                  {/* Compact Private Room Header Bar with E2EE Badge, Audio Toggle, Switch Room & Nuke Chat Button */}
+                  {/* Compact Private Room Header Bar with Switch Room & Nuke Chat Button */}
                   <div className="shrink-0 px-3 sm:px-6 py-2 border-b border-zinc-800/80 bg-zinc-950/80 flex items-center justify-between gap-2 w-full max-w-full select-none">
                     <div className="min-w-0 flex-1 space-y-0.5">
                       <div className="flex items-center gap-1.5 text-xs sm:text-sm font-semibold text-zinc-100 min-w-0">
@@ -2046,7 +2162,7 @@ export default function App() {
                         </span>
                         <span className="text-zinc-600 shrink-0">·</span>
                         <span className="text-[11px] font-normal text-zinc-400 shrink-0">
-                          {peerOnline ? 'Online · E2EE' : 'Async · E2EE'}
+                          {peerOnline ? 'Online' : 'Offline'}
                         </span>
                       </div>
                       <div className="flex items-center gap-1.5 text-[10px] sm:text-xs text-zinc-400 font-mono tabular-nums truncate">
@@ -2056,19 +2172,6 @@ export default function App() {
                     </div>
 
                     <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={toggleSoundEnabled}
-                        className="p-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-300 transition-colors cursor-pointer shrink-0 flex items-center justify-center"
-                        title={soundEnabled ? 'Mute notification ping' : 'Unmute notification ping'}
-                        aria-label="Toggle notification sound"
-                      >
-                        {soundEnabled ? (
-                          <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
-                        ) : (
-                          <VolumeX className="w-3.5 h-3.5 text-zinc-500" />
-                        )}
-                      </button>
                       <button
                         type="button"
                         onClick={() => {
@@ -2130,8 +2233,8 @@ export default function App() {
                           ? 'bg-zinc-800 border-emerald-500/60 text-emerald-400'
                           : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                       }`}
-                      title="Open Extensive Emoji Picker"
-                      aria-label="Open Extensive Emoji Picker"
+                      title="Open Emoji Picker"
+                      aria-label="Open Emoji Picker"
                     >
                       <Smile className="w-4 h-4" />
                     </button>
@@ -2140,7 +2243,7 @@ export default function App() {
                       type="text"
                       value={privateDraft}
                       onChange={(e) => handlePrivateDraftChange(e.target.value)}
-                      placeholder={`Encrypted message to ${activePeerId}...`}
+                      placeholder={`Message ${activePeerId}...`}
                       maxLength={4000}
                       className="select-text min-w-0 flex-1 px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 transition-colors"
                     />
@@ -2239,7 +2342,7 @@ export default function App() {
             </div>
 
             <p className="text-xs text-zinc-300 leading-relaxed">
-              This action will <strong className="text-rose-400">permanently and irreversibly delete</strong> all encrypted private chat history, reactions, and room records for both you (<code className="font-mono">{myId}</code>) and your peer (<code className="font-mono">{activePeerId}</code>) in real time.
+              This action will <strong className="text-rose-400">permanently and irreversibly delete</strong> all private chat history, reactions, and room records for both you (<code className="font-mono">{myId}</code>) and your peer (<code className="font-mono">{activePeerId}</code>) in real time.
             </p>
 
             <div className="flex items-center justify-end gap-2.5 pt-2">

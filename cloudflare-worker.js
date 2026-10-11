@@ -1,14 +1,25 @@
-// Cloudflare Worker + Durable Object (Blind Zero-Knowledge E2EE Ciphertext Relay + Real-time WebSockets)
-// WhisperNet Zero-Trace Backend: Stores and forwards opaque AES-256-GCM ciphertext and ECDH public keys without access to private keys or plaintext.
+// Cloudflare Worker + Durable Object (Zero-Trace Blind Relay + Real-time WebSockets)
+// WhisperNet Zero-Trace Backend: Collision-Safe Identity Engine (4 -> 5 -> 6 chars), 24h TTL Purge, & Bilateral Nuke
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 const GLOBAL_ROOM_ID = 'GLOBAL';
+const ID_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 function normalizeCode(code) {
   return String(code || '')
     .trim()
     .toUpperCase()
     .replace(/[^A-Z0-9-]/g, '');
+}
+
+function generateRandomUserId(length) {
+  let suffix = '';
+  const randomBytes = new Uint32Array(length);
+  crypto.getRandomValues(randomBytes);
+  for (let i = 0; i < length; i++) {
+    suffix += ID_CHARS[randomBytes[i] % ID_CHARS.length];
+  }
+  return `USER-${suffix}`;
 }
 
 function buildRoomId(userA, userB) {
@@ -25,14 +36,31 @@ function extractPeerFromRoomId(roomId, myId) {
   return null;
 }
 
-function jsonResponse(data, status = 200) {
+function getCorsHeaders(request, env) {
+  const allowedRaw = (env && env.ALLOWED_ORIGINS) || '*';
+  const origin = request ? request.headers.get('Origin') : '*';
+  let allowOrigin = '*';
+  if (allowedRaw !== '*') {
+    const allowedList = allowedRaw.split(',').map((s) => s.trim());
+    if (origin && allowedList.includes(origin)) {
+      allowOrigin = origin;
+    } else if (allowedList.length > 0) {
+      allowOrigin = allowedList[0];
+    }
+  }
+  return {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  };
+}
+
+function jsonResponse(data, status = 200, request = null, env = null) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      ...getCorsHeaders(request, env),
     },
   });
 }
@@ -96,6 +124,48 @@ export class WhisperNetHub {
     );
     this.sql.exec(`DELETE FROM active_users WHERE last_seen < ?`, cutoff);
     this.sql.exec(`DELETE FROM message_reactions WHERE timestamp < ?`, cutoff);
+  }
+
+  isUserIdTaken(candidateId) {
+    const clean = normalizeCode(candidateId);
+    if (!clean) return false;
+    for (const c of this.clients) {
+      if (c.userId === clean) return true;
+    }
+    const cutoff = Date.now() - TTL_MS;
+    const rows = this.sql
+      .exec(
+        `SELECT user_id FROM active_users WHERE user_id = ? AND last_seen >= ? LIMIT 1`,
+        clean,
+        cutoff
+      )
+      .toArray();
+    return rows.length > 0;
+  }
+
+  assignCollisionFreeIdentity(requestedId, isExistingSession = false) {
+    const cleanRequested = normalizeCode(requestedId || '');
+    if (cleanRequested && /^USER-[A-Z0-9]{4,6}$/.test(cleanRequested)) {
+      if (isExistingSession || !this.isUserIdTaken(cleanRequested)) {
+        return { userId: cleanRequested, collisionResolved: false };
+      }
+    }
+
+    // Dynamic length scaling: 4 chars -> 5 chars -> 6 chars when collisions occur
+    const lengths = [4, 5, 6];
+    for (const len of lengths) {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const candidate = generateRandomUserId(len);
+        if (!this.isUserIdTaken(candidate)) {
+          return {
+            userId: candidate,
+            collisionResolved: Boolean(cleanRequested && candidate !== cleanRequested),
+          };
+        }
+      }
+    }
+
+    return { userId: generateRandomUserId(6), collisionResolved: true };
   }
 
   registerIdentity(userId, publicKey) {
@@ -224,17 +294,17 @@ export class WhisperNetHub {
   }
 
   broadcastRoomPresence(roomId) {
-    const participants = new Set();
+    const active = new Set();
     for (const c of this.clients) {
       if (c.roomId === roomId && c.userId) {
-        participants.add(c.userId);
+        active.add(c.userId);
       }
     }
     this.broadcastToRoom(roomId, {
       type: 'room:presence',
       roomId,
-      participants: Array.from(participants),
-      onlineCount: participants.size,
+      participants: Array.from(active),
+      onlineCount: active.size,
     });
   }
 
@@ -266,11 +336,11 @@ export class WhisperNetHub {
       .toArray();
     if (msgRows.length > 0) return true;
 
-    const candidateRoom = buildRoomId(cleanRequester, cleanTarget);
+    const candidateRoomId = buildRoomId(cleanRequester, cleanTarget);
     const roomRows = this.sql
       .exec(
         `SELECT room_id FROM rooms WHERE room_id = ? AND created_at >= ? LIMIT 1`,
-        candidateRoom,
+        candidateRoomId,
         cutoff
       )
       .toArray();
@@ -279,17 +349,14 @@ export class WhisperNetHub {
 
   async fetch(request) {
     const url = new URL(request.url);
-    const { pathname } = url;
+    const pathname = url.pathname;
 
     if (request.method === 'OPTIONS') {
-      return jsonResponse({ ok: true });
+      return jsonResponse({ ok: true }, 200, request, this.env);
     }
 
-    // WebSocket Upgrade (/ws)
-    if (pathname === '/ws') {
-      if (request.headers.get('Upgrade') !== 'websocket') {
-        return new Response('Expected WebSocket upgrade', { status: 426 });
-      }
+    // WebSocket Upgrade at /ws
+    if (pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
@@ -340,16 +407,30 @@ export class WhisperNetHub {
 
     this.cleanupExpiredData();
 
-    // POST /api/users/register
+    // POST /api/users/register (Collision Check + Dynamic 4->5->6 Character Scaling)
     if (pathname === '/api/users/register' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
-      const userId = normalizeCode(body.userId);
+      const requestedId = normalizeCode(body.userId);
+      const isExistingSession = Boolean(body.isExistingSession);
       const publicKey = body.publicKey ? String(body.publicKey) : undefined;
-      if (!userId || userId.length < 4) {
-        return jsonResponse({ ok: false, error: 'Invalid User ID.' }, 400);
-      }
+
+      const { userId, collisionResolved } = this.assignCollisionFreeIdentity(
+        requestedId,
+        isExistingSession
+      );
+
       this.registerIdentity(userId, publicKey);
-      return jsonResponse({ ok: true, userId, timestamp: Date.now() });
+      return jsonResponse(
+        {
+          ok: true,
+          userId,
+          collisionResolved,
+          timestamp: Date.now(),
+        },
+        200,
+        request,
+        this.env
+      );
     }
 
     // GET /api/global/messages
@@ -371,10 +452,10 @@ export class WhisperNetHub {
         timestamp: Number(r.timestamp),
         reactions: reactionsByMsg[String(r.id)] || {},
       }));
-      return jsonResponse({ ok: true, roomId: GLOBAL_ROOM_ID, messages });
+      return jsonResponse({ ok: true, roomId: GLOBAL_ROOM_ID, messages }, 200, request, this.env);
     }
 
-    // POST /api/global/messages (Receives and stores client-encrypted ciphertext)
+    // POST /api/global/messages
     if (pathname === '/api/global/messages' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
       const senderId = normalizeCode(body.senderId);
@@ -385,7 +466,12 @@ export class WhisperNetHub {
         `GLB-${now}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
 
       if (!senderId || !content) {
-        return jsonResponse({ ok: false, error: 'Missing senderId or content.' }, 400);
+        return jsonResponse(
+          { ok: false, error: 'Missing senderId or content.' },
+          400,
+          request,
+          this.env
+        );
       }
       this.registerIdentity(senderId);
       this.sql.exec(
@@ -409,10 +495,10 @@ export class WhisperNetHub {
         roomId: GLOBAL_ROOM_ID,
         message: messageRecord,
       });
-      return jsonResponse({ ok: true, message: messageRecord });
+      return jsonResponse({ ok: true, message: messageRecord }, 200, request, this.env);
     }
 
-    // POST /api/rooms/connect (Relays peer ECDH public key for client-side E2EE key derivation)
+    // POST /api/rooms/connect
     if (pathname === '/api/rooms/connect' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
       const myId = normalizeCode(body.myId);
@@ -421,12 +507,19 @@ export class WhisperNetHub {
       const notifyPeer = body.notifyPeer !== false;
 
       if (!myId || myId.length < 4) {
-        return jsonResponse({ ok: false, error: 'Invalid session identity code.' }, 400);
+        return jsonResponse(
+          { ok: false, error: 'Invalid session identity code.' },
+          400,
+          request,
+          this.env
+        );
       }
       if (!peerId || !/^USER-[A-Z0-9]{4,8}$/.test(peerId) || myId === peerId) {
         return jsonResponse(
           { ok: false, error: 'User not found. Please check the ID and try again.' },
-          404
+          404,
+          request,
+          this.env
         );
       }
       this.registerIdentity(myId, myPublicKey);
@@ -434,7 +527,9 @@ export class WhisperNetHub {
       if (!this.doesUserExistOrOnline(peerId, myId)) {
         return jsonResponse(
           { ok: false, error: 'User not found. Please check the ID and try again.' },
-          404
+          404,
+          request,
+          this.env
         );
       }
 
@@ -486,17 +581,22 @@ export class WhisperNetHub {
         });
       }
 
-      return jsonResponse({
-        ok: true,
-        room: {
-          room_id: roomId,
-          created_at: createdAt,
-          expires_at: createdAt + TTL_MS,
-          peer_id: peerId,
-          peer_public_key: peerPublicKey,
+      return jsonResponse(
+        {
+          ok: true,
+          room: {
+            room_id: roomId,
+            created_at: createdAt,
+            expires_at: createdAt + TTL_MS,
+            peer_id: peerId,
+            peer_public_key: peerPublicKey,
+          },
+          messages,
         },
-        messages,
-      });
+        200,
+        request,
+        this.env
+      );
     }
 
     // GET /api/users/:userId/conversations
@@ -521,14 +621,14 @@ export class WhisperNetHub {
         const peerId = extractPeerFromRoomId(roomId, myId);
         if (!peerId) continue;
 
-        const lastRows = this.sql
+        const lastMsg = this.sql
           .exec(
             `SELECT id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 1`,
             roomId,
             cutoff
           )
           .toArray();
-        const countRows = this.sql
+        const countRes = this.sql
           .exec(
             `SELECT COUNT(*) as count FROM messages WHERE room_id = ? AND timestamp >= ?`,
             roomId,
@@ -536,12 +636,12 @@ export class WhisperNetHub {
           )
           .toArray();
 
-        const lastMessage = lastRows[0]
+        const lastMessage = lastMsg[0]
           ? {
-              id: String(lastRows[0].id),
-              sender_id: String(lastRows[0].sender_id),
-              content: String(lastRows[0].content),
-              timestamp: Number(lastRows[0].timestamp),
+              id: String(lastMsg[0].id),
+              sender_id: String(lastMsg[0].sender_id),
+              content: String(lastMsg[0].content),
+              timestamp: Number(lastMsg[0].timestamp),
             }
           : null;
 
@@ -551,105 +651,123 @@ export class WhisperNetHub {
           peer_public_key: this.getPeerPublicKey(peerId),
           created_at: createdAt,
           expires_at: createdAt + TTL_MS,
-          message_count: Number(countRows[0]?.count ?? 0),
+          message_count: Number(countRes[0]?.count ?? 0),
           last_message: lastMessage,
           updated_at: lastMessage ? lastMessage.timestamp : createdAt,
         });
       }
       conversations.sort((a, b) => b.updated_at - a.updated_at);
-      return jsonResponse({ ok: true, conversations });
+      return jsonResponse({ ok: true, conversations }, 200, request, this.env);
     }
 
-    // GET or POST /api/rooms/:roomId/messages (Blindly stores and forwards E2EE ciphertext)
-    const roomMsgMatch = pathname.match(/^\/api\/rooms\/([^/]+)\/messages$/);
-    if (roomMsgMatch) {
-      const roomId = decodeURIComponent(roomMsgMatch[1]);
-      if (request.method === 'GET') {
-        const roomRows = this.sql
-          .exec(`SELECT room_id, created_at FROM rooms WHERE room_id = ?`, roomId)
-          .toArray();
-        if (roomRows.length === 0) {
-          return jsonResponse({ ok: true, roomExists: false, room: null, messages: [] });
-        }
-        const createdAt = Number(roomRows[0].created_at);
-        const cutoff = Date.now() - TTL_MS;
-        const rows = this.sql
-          .exec(
-            `SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC`,
-            roomId,
-            cutoff
-          )
-          .toArray();
-        const reactionsByMsg = this.getReactionsForRoom(roomId, cutoff);
-        const messages = rows.map((r) => ({
-          id: String(r.id),
-          room_id: String(r.room_id),
-          sender_id: String(r.sender_id),
-          content: String(r.content),
-          timestamp: Number(r.timestamp),
-          reactions: reactionsByMsg[String(r.id)] || {},
-        }));
-        return jsonResponse({
+    // GET /api/rooms/:roomId/messages
+    const roomMsgsMatch = pathname.match(/^\/api\/rooms\/([^/]+)\/messages$/);
+    if (roomMsgsMatch && request.method === 'GET') {
+      const roomId = decodeURIComponent(roomMsgsMatch[1]);
+      const cutoff = Date.now() - TTL_MS;
+      const roomCheck = this.sql
+        .exec(`SELECT room_id, created_at FROM rooms WHERE room_id = ?`, roomId)
+        .toArray();
+      if (roomCheck.length === 0) {
+        return jsonResponse(
+          { ok: true, roomExists: false, messages: [] },
+          200,
+          request,
+          this.env
+        );
+      }
+      const rows = this.sql
+        .exec(
+          `SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC`,
+          roomId,
+          cutoff
+        )
+        .toArray();
+      const reactionsByMsg = this.getReactionsForRoom(roomId, cutoff);
+      const messages = rows.map((r) => ({
+        id: String(r.id),
+        room_id: String(r.room_id),
+        sender_id: String(r.sender_id),
+        content: String(r.content),
+        timestamp: Number(r.timestamp),
+        reactions: reactionsByMsg[String(r.id)] || {},
+      }));
+      return jsonResponse(
+        {
           ok: true,
           roomExists: true,
-          room: { room_id: roomId, created_at: createdAt, expires_at: createdAt + TTL_MS },
+          createdAt: Number(roomCheck[0].created_at),
           messages,
-        });
+        },
+        200,
+        request,
+        this.env
+      );
+    }
+
+    // POST /api/rooms/:roomId/messages
+    if (roomMsgsMatch && request.method === 'POST') {
+      const roomId = decodeURIComponent(roomMsgsMatch[1]);
+      const body = await request.json().catch(() => ({}));
+      const senderId = normalizeCode(body.senderId);
+      const content = String(body.content || '').trim();
+      const now = Date.now();
+      const messageId =
+        String(body.id || '').trim() ||
+        `MSG-${now}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+
+      if (!roomId || !senderId || !content) {
+        return jsonResponse(
+          { ok: false, error: 'Missing required message fields.' },
+          400,
+          request,
+          this.env
+        );
       }
+      this.registerIdentity(senderId);
+      this.sql.exec(
+        `INSERT OR IGNORE INTO rooms (room_id, created_at) VALUES (?, ?)`,
+        roomId,
+        now
+      );
+      this.sql.exec(
+        `INSERT OR IGNORE INTO messages (id, room_id, sender_id, content, timestamp) VALUES (?, ?, ?, ?, ?)`,
+        messageId,
+        roomId,
+        senderId,
+        content,
+        now
+      );
 
-      if (request.method === 'POST') {
-        const body = await request.json().catch(() => ({}));
-        const senderId = normalizeCode(body.senderId);
-        const content = String(body.content || '').trim();
-        const now = Date.now();
-        const messageId =
-          String(body.id || '').trim() ||
-          `MSG-${now}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+      const messageRecord = {
+        id: messageId,
+        room_id: roomId,
+        sender_id: senderId,
+        content,
+        timestamp: now,
+        reactions: {},
+      };
 
-        if (!roomId || !senderId || !content) {
-          return jsonResponse({ ok: false, error: 'Missing required fields.' }, 400);
-        }
-        this.registerIdentity(senderId);
-        this.sql.exec(
-          `INSERT OR IGNORE INTO rooms (room_id, created_at) VALUES (?, ?)`,
+      this.broadcastToRoom(roomId, {
+        type: 'message:created',
+        roomId,
+        message: messageRecord,
+      });
+
+      const recipientId = extractPeerFromRoomId(roomId, senderId);
+      const senderPublicKey = this.getPeerPublicKey(senderId);
+      if (recipientId) {
+        this.sendToUser(recipientId, {
+          type: 'private:message_notification',
           roomId,
-          now
-        );
-        this.sql.exec(
-          `INSERT OR IGNORE INTO messages (id, room_id, sender_id, content, timestamp) VALUES (?, ?, ?, ?, ?)`,
-          messageId,
-          roomId,
-          senderId,
-          content,
-          now
-        );
-        const messageRecord = {
-          id: messageId,
-          room_id: roomId,
-          sender_id: senderId,
-          content,
-          timestamp: now,
-          reactions: {},
-        };
-        this.broadcastToRoom(roomId, {
-          type: 'message:created',
-          roomId,
+          fromUserId: senderId,
+          fromPublicKey: senderPublicKey,
+          toUserId: recipientId,
           message: messageRecord,
         });
-        const recipientId = extractPeerFromRoomId(roomId, senderId);
-        if (recipientId) {
-          this.sendToUser(recipientId, {
-            type: 'private:message_notification',
-            roomId,
-            fromUserId: senderId,
-            fromPublicKey: this.getPeerPublicKey(senderId),
-            toUserId: recipientId,
-            message: messageRecord,
-            timestamp: now,
-          });
-        }
-        return jsonResponse({ ok: true, message: messageRecord });
       }
+
+      return jsonResponse({ ok: true, message: messageRecord }, 200, request, this.env);
     }
 
     // POST /api/messages/:messageId/reactions
@@ -660,55 +778,72 @@ export class WhisperNetHub {
       const roomId = String(body.roomId || '').trim();
       const userId = normalizeCode(body.userId);
       const emoji = String(body.emoji || '').trim();
-      const mode = String(body.mode || 'toggle');
+      const mode = body.mode === 'add' ? 'add' : 'toggle';
 
       if (!messageId || !roomId || !userId || !emoji) {
-        return jsonResponse({ ok: false, error: 'Missing reaction parameters.' }, 400);
+        return jsonResponse(
+          { ok: false, error: 'Missing reaction fields.' },
+          400,
+          request,
+          this.env
+        );
       }
 
       const existing = this.sql
         .exec(
-          `SELECT message_id FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?`,
+          `SELECT emoji FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ? LIMIT 1`,
           messageId,
           userId,
           emoji
         )
         .toArray();
 
-      if (existing.length > 0) {
-        if (mode === 'toggle') {
-          this.sql.exec(
-            `DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?`,
-            messageId,
-            userId,
-            emoji
-          );
-        }
-      } else {
+      const now = Date.now();
+      if (existing.length > 0 && mode === 'toggle') {
+        this.sql.exec(
+          `DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?`,
+          messageId,
+          userId,
+          emoji
+        );
+      } else if (existing.length === 0) {
         this.sql.exec(
           `INSERT INTO message_reactions (message_id, room_id, user_id, emoji, timestamp) VALUES (?, ?, ?, ?, ?)`,
           messageId,
           roomId,
           userId,
           emoji,
-          Date.now()
+          now
         );
       }
 
-      const updatedReactions = this.getReactionsForMessage(messageId);
+      const reactions = this.getReactionsForMessage(messageId);
       const payload = {
         type: 'message:reaction_updated',
         roomId,
         messageId,
-        reactions: updatedReactions,
+        reactions,
+        userId,
+        emoji,
       };
-      this.broadcastToRoom(roomId, payload);
-      if (roomId !== GLOBAL_ROOM_ID) {
-        const peerId = extractPeerFromRoomId(roomId, userId);
-        if (peerId) this.sendToUser(peerId, payload);
-        this.sendToUser(userId, payload);
+
+      if (roomId === GLOBAL_ROOM_ID) {
+        this.broadcastToAll(payload);
+      } else {
+        this.broadcastToRoom(roomId, payload);
+        const parts = roomId.split('__');
+        if (parts.length === 2) {
+          this.sendToUser(parts[0], payload);
+          this.sendToUser(parts[1], payload);
+        }
       }
-      return jsonResponse({ ok: true, messageId, roomId, reactions: updatedReactions });
+
+      return jsonResponse(
+        { ok: true, messageId, roomId, reactions },
+        200,
+        request,
+        this.env
+      );
     }
 
     // DELETE /api/rooms/:roomId/nuke
@@ -716,13 +851,12 @@ export class WhisperNetHub {
     if (nukeMatch && request.method === 'DELETE') {
       const roomId = decodeURIComponent(nukeMatch[1]);
       const body = await request.json().catch(() => ({}));
-      const triggeredBy = normalizeCode(body.triggeredBy || 'UNKNOWN');
+      const triggeredBy = normalizeCode(body.triggeredBy || 'PEER');
 
       if (!roomId || roomId === GLOBAL_ROOM_ID) {
-        return jsonResponse({ ok: false, error: 'Valid private Room ID is required.' }, 400);
+        return jsonResponse({ ok: false, error: 'Invalid room ID.' }, 400, request, this.env);
       }
 
-      const peerId = extractPeerFromRoomId(roomId, triggeredBy);
       this.sql.exec(`DELETE FROM message_reactions WHERE room_id = ?`, roomId);
       this.sql.exec(`DELETE FROM messages WHERE room_id = ?`, roomId);
       this.sql.exec(`DELETE FROM rooms WHERE room_id = ?`, roomId);
@@ -733,27 +867,37 @@ export class WhisperNetHub {
         triggeredBy,
         timestamp: Date.now(),
       };
-      this.broadcastToRoom(roomId, nukePayload);
-      if (peerId) this.sendToUser(peerId, nukePayload);
-      this.sendToUser(triggeredBy, nukePayload);
 
-      return jsonResponse({
-        ok: true,
-        nukedRoomId: roomId,
-        deletedMessages: 1,
-        timestamp: Date.now(),
-      });
+      this.broadcastToRoom(roomId, nukePayload);
+      const parts = roomId.split('__');
+      if (parts.length === 2) {
+        this.sendToUser(parts[0], nukePayload);
+        this.sendToUser(parts[1], nukePayload);
+      }
+
+      return jsonResponse(
+        {
+          ok: true,
+          nukedRoomId: roomId,
+          deletedMessages: 1,
+          deletedRoom: 1,
+          timestamp: Date.now(),
+        },
+        200,
+        request,
+        this.env
+      );
     }
 
-    return jsonResponse({ ok: false, error: 'API endpoint not found.' }, 404);
+    return jsonResponse({ ok: false, error: 'Route not found.' }, 404, request, this.env);
   }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === '/ws' || url.pathname.startsWith('/api/')) {
-      const id = env.WHISPERNET_HUB.idFromName('GLOBAL_ZERO_TRACE_HUB');
+    if (url.pathname.startsWith('/api/') || url.pathname === '/ws') {
+      const id = env.WHISPERNET_HUB.idFromName('GLOBAL_WHISPERNET_HUB');
       const stub = env.WHISPERNET_HUB.get(id);
       return stub.fetch(request);
     }

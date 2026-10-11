@@ -3,6 +3,9 @@ main = "cloudflare-worker.js"
 compatibility_date = "2025-02-01"
 workers_dev = true
 
+[vars]
+ALLOWED_ORIGINS = "*"
+
 # Serve the built React + Tailwind SPA from ./dist alongside the Worker API & WebSocket
 [assets]
 directory = "./dist"
