@@ -26,6 +26,10 @@ import {
   getOrCreateMyEcdhIdentity,
   resetMyEcdhIdentity,
   registerPeerPublicKey,
+  initializeRoomSessionKey,
+  purgeRoomCryptoSession,
+  parseUrlHashContext,
+  bootstrapRoomUrlHashSecret,
   encryptMessageContent,
   decryptMessageContent,
 } from './crypto';
@@ -85,6 +89,17 @@ interface EmojiCategory {
   emojis: string[];
 }
 
+interface QueuedOutgoingMessage {
+  id: string;
+  scope: 'global' | 'private';
+  roomId: string;
+  peerId?: string;
+  rawText: string;
+  timestamp: number;
+}
+
+const BROADCAST_CHANNEL_NAME = 'whispernet_zero_trace_multitab_sync_v1';
+
 // 1-Hour Ephemeral TTL for all messages, rooms, and user identities
 const TTL_MS = 60 * 60 * 1000;
 // Prolonged Inactivity Idle Timeout (15 minutes) triggers automatic local wipe & disconnect
@@ -92,6 +107,8 @@ const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
 const SESSION_IDENTITY_KEY = 'whispernet_immutable_session_id_v1';
 const SESSION_IDENTITY_META_KEY = 'whispernet_identity_meta_v1';
+const SESSION_ACTIVE_TAB_KEY = 'whispernet_active_tab_v1';
+const SESSION_ACTIVE_PEER_KEY = 'whispernet_active_peer_v1';
 const SOUND_ENABLED_KEY = 'whispernet_sound_enabled_v1';
 
 // Public STUN servers for non-intrusive WebRTC P2P data channel negotiation
@@ -263,6 +280,124 @@ function formatCountdown(msRemaining: number): string {
     .join(':');
 }
 
+// Lightweight Pure-Text Markdown & Code Block Parser (Safe React Elements, Zero XSS)
+function renderInlineMarkdown(text: string, isMine: boolean): React.ReactNode[] {
+  const tokenRegex = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*)/g;
+  const parts = text.split(tokenRegex);
+  return parts.map((part, idx) => {
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+      return (
+        <code
+          key={idx}
+          className={`px-1.5 py-0.5 rounded font-mono text-[11px] sm:text-xs ${
+            isMine
+              ? 'bg-emerald-950/35 text-zinc-950 font-semibold'
+              : 'bg-zinc-950 text-emerald-300 border border-zinc-800'
+          }`}
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return (
+        <strong key={idx} className="font-bold">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+      return (
+        <em key={idx} className="italic">
+          {part.slice(1, -1)}
+        </em>
+      );
+    }
+    return <React.Fragment key={idx}>{part}</React.Fragment>;
+  });
+}
+
+function renderFormattedMessageContent(content: string, isMine: boolean): React.ReactNode {
+  if (!content) return null;
+  const blockRegex = /```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g;
+  const segments: Array<
+    | { type: 'text'; value: string }
+    | { type: 'code'; lang: string; value: string }
+  > = [];
+
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = blockRegex.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', value: content.slice(lastIndex, match.index) });
+    }
+    segments.push({
+      type: 'code',
+      lang: (match[1] || 'code').trim(),
+      value: match[2].replace(/\n$/, ''),
+    });
+    lastIndex = blockRegex.lastIndex;
+  }
+  if (lastIndex < content.length) {
+    segments.push({ type: 'text', value: content.slice(lastIndex) });
+  }
+
+  return (
+    <div className="space-y-1.5">
+      {segments.map((seg, i) => {
+        if (seg.type === 'code') {
+          return (
+            <div
+              key={i}
+              className={`my-1 rounded-lg overflow-hidden border text-left ${
+                isMine
+                  ? 'bg-zinc-950/90 border-zinc-800 text-zinc-100'
+                  : 'bg-black/90 border-zinc-800 text-zinc-100'
+              }`}
+            >
+              {seg.lang && (
+                <div className="px-2.5 py-1 bg-zinc-900/90 border-b border-zinc-800 text-[10px] font-mono text-emerald-400 uppercase tracking-wider">
+                  {seg.lang}
+                </div>
+              )}
+              <pre className="p-2.5 text-[11px] sm:text-xs font-mono leading-relaxed overflow-x-auto whitespace-pre select-text">
+                <code>{seg.value}</code>
+              </pre>
+            </div>
+          );
+        }
+
+        const lines = seg.value.split('\n');
+        return (
+          <div key={i} className="space-y-0.5">
+            {lines.map((line, lineIdx) => {
+              if (line.startsWith('> ')) {
+                return (
+                  <blockquote
+                    key={lineIdx}
+                    className={`pl-2.5 border-l-2 italic ${
+                      isMine
+                        ? 'border-zinc-900/60 text-zinc-900'
+                        : 'border-emerald-500/60 text-zinc-300'
+                    }`}
+                  >
+                    {renderInlineMarkdown(line.slice(2), isMine)}
+                  </blockquote>
+                );
+              }
+              return (
+                <div key={lineIdx} className="min-h-[1.1em]">
+                  {renderInlineMarkdown(line, isMine)}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 async function decryptMessageBatch(
   messages: ChatMessage[],
   roomId: string,
@@ -284,7 +419,13 @@ export default function App() {
   const previousUserIdRef = useRef<string | null>(null);
 
   // Navigation Tabs: 'global' (Global Chat) | 'private' (Private Chats)
-  const [activeTab, setActiveTab] = useState<'global' | 'private'>('global');
+  const [activeTab, setActiveTab] = useState<'global' | 'private'>(() => {
+    try {
+      return sessionStorage.getItem(SESSION_ACTIVE_TAB_KEY) === 'private' ? 'private' : 'global';
+    } catch {
+      return 'global';
+    }
+  });
   const [showMobileDrawer, setShowMobileDrawer] = useState<boolean>(false);
 
   // Global Public Room State
@@ -350,6 +491,13 @@ export default function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const soundEnabledRef = useRef<boolean>(soundEnabled);
   const initialConvsSyncedRef = useRef<boolean>(false);
+  const globalScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const privateScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const isNearBottomGlobalRef = useRef<boolean>(true);
+  const isNearBottomPrivateRef = useRef<boolean>(true);
+  const offlineQueueRef = useRef<QueuedOutgoingMessage[]>([]);
+  const isFlushingQueueRef = useRef<boolean>(false);
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const globalEndRef = useRef<HTMLDivElement | null>(null);
   const privateEndRef = useRef<HTMLDivElement | null>(null);
   const globalInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -360,12 +508,35 @@ export default function App() {
   const activeRoomIdRef = useRef<string | null>(null);
   const activeTabRef = useRef<'global' | 'private'>('global');
   const activePeerIdRef = useRef<string | null>(null);
+  const restoredSessionPeerRef = useRef<boolean>(false);
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
 
   activeRoomIdRef.current = activeRoom?.room_id || null;
   activeTabRef.current = activeTab;
   activePeerIdRef.current = activePeerId;
   soundEnabledRef.current = soundEnabled;
+
+  // Persist active tab across page refreshes (F5) within the active session
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(SESSION_ACTIVE_TAB_KEY, activeTab);
+    } catch {
+      // ignore
+    }
+  }, [activeTab]);
+
+  // Persist active 1-on-1 peer across page refreshes (F5) within the active session
+  useEffect(() => {
+    try {
+      if (activePeerId) {
+        sessionStorage.setItem(SESSION_ACTIVE_PEER_KEY, activePeerId);
+      } else if (restoredSessionPeerRef.current) {
+        sessionStorage.removeItem(SESSION_ACTIVE_PEER_KEY);
+      }
+    } catch {
+      // ignore
+    }
+  }, [activePeerId]);
 
   // Lightweight Web Audio API Synthesizer for Instant Zero-Latency Notification Ping
   const playNotificationPing = useCallback((variant: 'message' | 'request' = 'message') => {
@@ -843,6 +1014,12 @@ export default function App() {
         }
 
         resetMyEcdhIdentity();
+        try {
+          sessionStorage.removeItem(SESSION_ACTIVE_PEER_KEY);
+          sessionStorage.removeItem(SESSION_ACTIVE_TAB_KEY);
+        } catch {
+          // ignore
+        }
         const rotated = generateFreshClientSideIdentity();
         isExistingSessionRef.current = false;
         setMyId(rotated.id);
@@ -857,27 +1034,49 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [myId, myIdExpiresAt, closeWebRtcChannel]);
 
-  // Auto-scroll Global Chat only on new message arrival or tab switch
+  // Smart Auto-Scroll: Automatically scroll to latest incoming messages only when near bottom
   const prevGlobalLenRef = useRef<number>(0);
   useEffect(() => {
     if (activeTab === 'global') {
-      if (globalMessages.length !== prevGlobalLenRef.current) {
+      if (
+        globalMessages.length !== prevGlobalLenRef.current &&
+        isNearBottomGlobalRef.current
+      ) {
         globalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }
       prevGlobalLenRef.current = globalMessages.length;
     }
   }, [globalMessages.length, activeTab]);
 
-  // Auto-scroll Private Chat only on new message arrival, typing, or disconnect state change
+  // Smart Auto-Scroll Private Chat: Lock to bottom unless user manually scrolled upward to inspect history
   const prevPrivateLenRef = useRef<number>(0);
   useEffect(() => {
     if (activeTab === 'private') {
-      if (privateMessages.length !== prevPrivateLenRef.current || peerTyping || peerDisconnected) {
+      if (
+        (privateMessages.length !== prevPrivateLenRef.current ||
+          peerTyping ||
+          peerDisconnected) &&
+        isNearBottomPrivateRef.current
+      ) {
         privateEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }
       prevPrivateLenRef.current = privateMessages.length;
     }
   }, [privateMessages.length, peerTyping, peerDisconnected, activeTab]);
+
+  const handleViewportScroll = useCallback(
+    (scope: 'global' | 'private', el: HTMLDivElement | null) => {
+      if (!el) return;
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const isNearBottom = distanceFromBottom <= 120;
+      if (scope === 'global') {
+        isNearBottomGlobalRef.current = isNearBottom;
+      } else {
+        isNearBottomPrivateRef.current = isNearBottom;
+      }
+    },
+    []
+  );
 
   // Smart Auto-Resizing Textarea Helper
   const syncTextareaHeight = useCallback((el: HTMLTextAreaElement | null) => {
@@ -947,6 +1146,10 @@ export default function App() {
           registerPeerPublicKey(targetPeer, data.room.peer_public_key);
         }
 
+        // Automatically derive temporary cryptographic session key & attach URL #hash secret
+        bootstrapRoomUrlHashSecret(data.room.room_id, targetPeer);
+        await initializeRoomSessionKey(data.room.room_id, targetPeer);
+
         const rawMessages: ChatMessage[] = Array.isArray(data.messages) ? data.messages : [];
         rawMessages.forEach((m) => seenMessageIdsRef.current.add(m.id));
 
@@ -961,7 +1164,7 @@ export default function App() {
         setPeerDisconnected(data.room?.peer_alive === false);
         setPrivateMessages(decryptedMessages);
         setActiveTab('private');
-        setPeerInput(targetPeer);
+        setPeerInput('');
         setShowMobileDrawer(false);
         setPickerOpenFor(null);
 
@@ -1000,6 +1203,67 @@ export default function App() {
     [myId, fetchConversations, initiateBackgroundWebRtcP2P]
   );
 
+  // Restore active 1-on-1 room automatically across page refresh (F5) or from URL #hash invite
+  useEffect(() => {
+    if (restoredSessionPeerRef.current) return;
+    restoredSessionPeerRef.current = true;
+    try {
+      const hashCtx = parseUrlHashContext();
+      const hashPeer = hashCtx.peerOrRoom ? normalizeUserCode(hashCtx.peerOrRoom) : '';
+      if (hashPeer && /^USER-[A-Z0-9]{4,8}$/.test(hashPeer) && hashPeer !== myId) {
+        connectToPeerChannel(hashPeer, false);
+        return;
+      }
+      const savedPeer = sessionStorage.getItem(SESSION_ACTIVE_PEER_KEY);
+      if (savedPeer && /^USER-[A-Z0-9]{4,8}$/.test(savedPeer) && savedPeer !== myId) {
+        connectToPeerChannel(savedPeer, false);
+      }
+    } catch {
+      // ignore
+    }
+  }, [myId, connectToPeerChannel]);
+
+  // Multi-Tab Synchronization via Native BroadcastChannel API
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return;
+    const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+    broadcastChannelRef.current = bc;
+
+    bc.onmessage = (event) => {
+      const data = event.data;
+      if (!data || typeof data !== 'object') return;
+
+      if (data.type === 'sync:global_message' && data.message) {
+        const msg: ChatMessage = data.message;
+        setGlobalMessages((prev) =>
+          prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]
+        );
+      } else if (data.type === 'sync:private_message' && data.message) {
+        const msg: ChatMessage = data.message;
+        if (msg.room_id === activeRoomIdRef.current) {
+          setPrivateMessages((prev) =>
+            prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]
+          );
+        }
+        fetchConversations();
+      } else if (data.type === 'sync:room_nuked' && data.roomId) {
+        if (data.roomId === activeRoomIdRef.current) {
+          closeWebRtcChannel();
+          setPrivateMessages([]);
+          setActiveRoom(null);
+          setActivePeerId(null);
+          setPeerDisconnected(false);
+        }
+        fetchConversations();
+      }
+    };
+
+    return () => {
+      bc.close();
+      broadcastChannelRef.current = null;
+    };
+  }, [fetchConversations, closeWebRtcChannel]);
+
   // Persistent WebSocket Connection with 30s Keep-Alive Ping-Pong, Exponential Backoff & WebRTC Signaling
   useEffect(() => {
     let isMounted = true;
@@ -1024,6 +1288,7 @@ export default function App() {
       ws.onopen = async () => {
         if (!isMounted) return;
         retryAttempt = 0;
+        flushOfflineMessageQueue();
         const { publicKeyJwkString } = await getOrCreateMyEcdhIdentity();
         ws.send(
           JSON.stringify({
@@ -1361,6 +1626,7 @@ export default function App() {
           // 11. Instant Room Nuke Event
           else if (payload.type === 'room:nuked' && payload.roomId) {
             const nukedId = String(payload.roomId);
+            purgeRoomCryptoSession(nukedId);
             fetchConversations();
 
             if (nukedId === activeRoomIdRef.current) {
@@ -1574,23 +1840,94 @@ export default function App() {
     }
   };
 
-  // Transmit Global Public Content
+  // Offline Message Queue Auto-Flush Engine: Automatically flushes buffered messages on network recovery
+  const flushOfflineMessageQueue = useCallback(async () => {
+    if (isFlushingQueueRef.current || offlineQueueRef.current.length === 0) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+    isFlushingQueueRef.current = true;
+    const snapshot = [...offlineQueueRef.current];
+    const remaining: QueuedOutgoingMessage[] = [];
+
+    for (const item of snapshot) {
+      try {
+        const encryptedCiphertext = await encryptMessageContent(
+          item.rawText,
+          item.roomId,
+          item.peerId
+        );
+        const endpoint =
+          item.scope === 'global'
+            ? '/api/global/messages'
+            : `/api/rooms/${encodeURIComponent(item.roomId)}/messages`;
+
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: item.id,
+            senderId: myId,
+            content: encryptedCiphertext,
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          if (item.scope === 'global') {
+            setGlobalMessages((prev) =>
+              prev.map((m) => (m.id === item.id ? { ...m, deliveryStatus: 'sent' } : m))
+            );
+          } else {
+            setPrivateMessages((prev) =>
+              prev.map((m) =>
+                m.id === item.id
+                  ? { ...m, deliveryStatus: peerOnline ? 'received' : 'sent' }
+                  : m
+              )
+            );
+          }
+        } else {
+          remaining.push(item);
+        }
+      } catch {
+        remaining.push(item);
+      }
+    }
+
+    offlineQueueRef.current = remaining;
+    isFlushingQueueRef.current = false;
+  }, [myId, peerOnline]);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      flushOfflineMessageQueue();
+    };
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [flushOfflineMessageQueue]);
+
+  // Transmit Global Public Content (with Offline Message Queue Resilience & Multi-Tab Sync)
   const sendGlobalContent = async (rawContent: string) => {
     const text = rawContent.trim();
     if (!text || isSendingGlobal) return;
 
-    const tempId = `GLB-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const now = Date.now();
+    const tempId = `GLB-${now}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
     const optimisticMsg: ChatMessage = {
       id: tempId,
       room_id: 'GLOBAL',
       sender_id: myId,
       content: text,
-      timestamp: Date.now(),
+      timestamp: now,
       reactions: {},
       deliveryStatus: 'sending',
     };
 
+    isNearBottomGlobalRef.current = true;
     setGlobalMessages((prev) => [...prev, optimisticMsg]);
+    broadcastChannelRef.current?.postMessage({
+      type: 'sync:global_message',
+      message: optimisticMsg,
+    });
     setIsSendingGlobal(true);
 
     try {
@@ -1607,16 +1944,27 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        setGlobalMessages((prev) => prev.filter((m) => m.id !== tempId));
-        setErrorBanner(data.error || 'Failed to post to Global Chat.');
+        offlineQueueRef.current.push({
+          id: tempId,
+          scope: 'global',
+          roomId: 'GLOBAL',
+          rawText: text,
+          timestamp: now,
+        });
       } else {
         setGlobalMessages((prev) =>
           prev.map((m) => (m.id === tempId ? { ...m, deliveryStatus: 'sent' } : m))
         );
       }
     } catch {
-      setGlobalMessages((prev) => prev.filter((m) => m.id !== tempId));
-      setErrorBanner('Network error: global message could not be delivered.');
+      // Network drop: keep message in UI as 'Sending...' and queue for automatic flush upon reconnection
+      offlineQueueRef.current.push({
+        id: tempId,
+        scope: 'global',
+        roomId: 'GLOBAL',
+        rawText: text,
+        timestamp: now,
+      });
     } finally {
       setIsSendingGlobal(false);
     }
@@ -1653,7 +2001,12 @@ export default function App() {
     };
 
     seenMessageIdsRef.current.add(tempId);
+    isNearBottomPrivateRef.current = true;
     setPrivateMessages((prev) => [...prev, optimisticMsg]);
+    broadcastChannelRef.current?.postMessage({
+      type: 'sync:private_message',
+      message: optimisticMsg,
+    });
     setIsSendingPrivate(true);
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -1735,13 +2088,20 @@ export default function App() {
         );
         fetchConversations();
       }
-    } catch {
-      setPrivateMessages((prev) => prev.filter((m) => m.id !== tempId));
-      setErrorBanner('Network error: private message could not be delivered.');
-    } finally {
-      setIsSendingPrivate(false);
-    }
-  };
+      } catch {
+        // Network drop: keep optimistic message in UI and buffer in offline queue for auto-flush
+        offlineQueueRef.current.push({
+          id: tempId,
+          scope: 'private',
+          roomId: activeRoom.room_id,
+          peerId: activePeerId || undefined,
+          rawText: text,
+          timestamp: now,
+        });
+      } finally {
+        setIsSendingPrivate(false);
+      }
+    };
 
   const handleSendPrivateMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1848,6 +2208,11 @@ export default function App() {
         });
       }
 
+      purgeRoomCryptoSession(activeRoom.room_id);
+      broadcastChannelRef.current?.postMessage({
+        type: 'sync:room_nuked',
+        roomId: activeRoom.room_id,
+      });
       closeWebRtcChannel();
       setPrivateMessages([]);
       setActiveRoom(null);
@@ -1977,7 +2342,7 @@ export default function App() {
                 : 'bg-zinc-900 border border-zinc-800 text-zinc-100 rounded-bl-xs'
             }`}
           >
-            {msg.content}
+            {renderFormattedMessageContent(msg.content, isMine)}
 
             {/* Animated Floating Heart on Double-Tap */}
             {isHeartBursting && (
@@ -2141,8 +2506,9 @@ export default function App() {
               type="text"
               value={peerInput}
               onChange={(e) => setPeerInput(e.target.value.toUpperCase())}
-              placeholder="USER-5LPT"
+              placeholder="CONNECT PEER ID"
               maxLength={16}
+              autoComplete="off"
               className="select-text min-w-0 flex-1 px-3 py-2 text-xs sm:text-sm font-mono bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500 transition-colors uppercase"
             />
             <button
@@ -2150,7 +2516,7 @@ export default function App() {
               disabled={isConnecting}
               className="px-3.5 py-2 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-zinc-950 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 cursor-pointer"
             >
-              <span>{isConnecting ? '...' : 'Chat'}</span>
+              <span>{isConnecting ? '...' : 'Connect'}</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -2259,7 +2625,7 @@ export default function App() {
                   >
                     <span className="truncate">{uid}</span>
                     <span className="text-[11px] text-zinc-500 shrink-0">
-                      {isMe ? 'You' : 'Chat 1-on-1 →'}
+                      {isMe ? 'You' : 'Connect →'}
                     </span>
                   </button>
                 );
@@ -2554,8 +2920,9 @@ export default function App() {
                     type="text"
                     value={peerInput}
                     onChange={(e) => setPeerInput(e.target.value.toUpperCase())}
-                    placeholder="Connect Peer ID (e.g. USER-5LPT)"
+                    placeholder="CONNECT PEER ID"
                     maxLength={16}
+                    autoComplete="off"
                     className="select-text min-w-0 flex-1 px-2.5 py-1.5 text-xs font-mono bg-zinc-900 border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 uppercase"
                   />
                   <button
@@ -2563,13 +2930,17 @@ export default function App() {
                     disabled={isConnecting}
                     className="px-2.5 py-1.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-zinc-950 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    Chat 1v1
+                    Connect
                   </button>
                 </form>
               </div>
 
-              {/* Scrollable Global Messages List (Minimal Empty State without helper text) */}
-              <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden touch-scroll p-3 sm:p-6 space-y-3.5 select-none">
+              {/* Scrollable Global Messages List (Smart Auto-Scroll & Mobile Keyboard Flex Viewport) */}
+              <div
+                ref={globalScrollContainerRef}
+                onScroll={(e) => handleViewportScroll('global', e.currentTarget)}
+                className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden touch-scroll p-3 sm:p-6 space-y-3.5 select-none"
+              >
                 {globalMessages.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-center p-4 space-y-2 text-zinc-500">
                     <Globe className="w-7 h-7 text-zinc-600" />
@@ -2669,8 +3040,9 @@ export default function App() {
                         type="text"
                         value={peerInput}
                         onChange={(e) => setPeerInput(e.target.value.toUpperCase())}
-                        placeholder="Enter Peer ID (e.g. USER-5LPT)"
+                        placeholder="CONNECT PEER ID"
                         maxLength={16}
+                        autoComplete="off"
                         className="select-text min-w-0 flex-1 px-3 py-2 text-xs sm:text-sm font-mono bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500 uppercase"
                       />
                       <button
@@ -2804,8 +3176,12 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Scrollable Private Messages List (Minimal Empty State without helper text) */}
-                  <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden touch-scroll p-3 sm:p-6 space-y-3.5 select-none">
+                  {/* Scrollable Private Messages List (Smart Auto-Scroll & Mobile Keyboard Flex Viewport) */}
+                  <div
+                    ref={privateScrollContainerRef}
+                    onScroll={(e) => handleViewportScroll('private', e.currentTarget)}
+                    className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden touch-scroll p-3 sm:p-6 space-y-3.5 select-none"
+                  >
                     {privateMessages.length === 0 ? (
                       <div className="h-full flex flex-col items-center justify-center text-center p-4 space-y-2 text-zinc-500">
                         <MessageSquareOff className="w-7 h-7 text-zinc-600" />

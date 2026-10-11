@@ -1,9 +1,10 @@
-// Client-Side End-to-End Encryption (E2EE) Engine using Native Web Crypto API (ECDH P-256 + HKDF + AES-256-GCM)
+// Client-Side End-to-End Encryption (E2EE) Engine using Native Web Crypto API (URL #hash Secret + ECDH P-256 + HKDF + AES-256-GCM)
 // Backend / Cloudflare Worker operates strictly as a blind zero-knowledge ciphertext relay.
 
 const E2EE_ENVELOPE_PREFIX = 'E2EE:v1:';
 const ECDH_IDENTITY_STORAGE_KEY = 'whispernet_ecdh_keypair_v1';
 const PEER_PUBKEY_CACHE_KEY = 'whispernet_peer_pubkeys_v1';
+const ROOM_HASH_KEY_STORAGE = 'whispernet_room_hash_keys_v1';
 const APP_CRYPTO_PEPPER = 'WHISPERNET-ZERO-TRACE-AES-256-GCM-PROTOCOL-2026';
 
 export interface StoredEcdhIdentity {
@@ -17,8 +18,137 @@ const IDENTITY_TTL_MS = 60 * 60 * 1000; // 1 Hour TTL
 let cachedMyKeyPair: CryptoKeyPair | null = null;
 let cachedMyPublicJwkStr: string | null = null;
 const peerPublicKeyStore = new Map<string, string>();
+const roomHashSecretStore = new Map<string, string>();
 const derivedRoomKeyCache = new Map<string, CryptoKey>();
 const decryptedPayloadCache = new Map<string, string>();
+
+// Load cached URL #hash secrets from sessionStorage across page refreshes (F5)
+function loadRoomHashSecrets(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const raw = sessionStorage.getItem(ROOM_HASH_KEY_STORAGE);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      for (const [k, v] of Object.entries(parsed)) {
+        roomHashSecretStore.set(k, v);
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function saveRoomHashSecrets(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const obj: Record<string, string> = {};
+    for (const [k, v] of roomHashSecretStore.entries()) {
+      obj[k] = v;
+    }
+    sessionStorage.setItem(ROOM_HASH_KEY_STORAGE, JSON.stringify(obj));
+  } catch {
+    // ignore
+  }
+}
+
+loadRoomHashSecrets();
+
+/**
+ * Advanced Client-Side URL Hash Encryption (#hash):
+ * Parses `#room=<PEER_OR_ROOM>&key=<MASTER_SECRET>` or `#<MASTER_SECRET>` from `window.location.hash`.
+ * Since URL hash fragments are NEVER sent over HTTP to Cloudflare Workers, the server remains 100% blind to the key.
+ */
+export function parseUrlHashContext(): { peerOrRoom?: string; hashSecret?: string } {
+  if (typeof window === 'undefined' || !window.location.hash) return {};
+  const rawHash = window.location.hash.slice(1).trim();
+  if (!rawHash || rawHash === 'global' || rawHash === 'private') return {};
+
+  if (rawHash.includes('=')) {
+    const params = new URLSearchParams(rawHash);
+    const peerOrRoom = params.get('peer') || params.get('room') || undefined;
+    const hashSecret = params.get('key') || undefined;
+    if (peerOrRoom && hashSecret) {
+      roomHashSecretStore.set(peerOrRoom.trim().toUpperCase(), hashSecret);
+      saveRoomHashSecrets();
+    } else if (hashSecret) {
+      roomHashSecretStore.set('DEFAULT', hashSecret);
+      saveRoomHashSecrets();
+    }
+    return { peerOrRoom, hashSecret };
+  }
+
+  // Direct `#master-key-xyz` format
+  if (rawHash.length >= 6) {
+    roomHashSecretStore.set('DEFAULT', rawHash);
+    saveRoomHashSecrets();
+    return { hashSecret: rawHash };
+  }
+
+  return {};
+}
+
+/**
+ * Automatic Key Bootstrap:
+ * Generates and attaches a cryptographic secret hash to the browser URL (`#peer=USER-XXXX&key=...`)
+ * when creating/joining a 1-on-1 room, ensuring zero-knowledge URL fragment key derivation.
+ */
+export function bootstrapRoomUrlHashSecret(roomId: string, peerId?: string): string {
+  const cleanRoom = roomId.trim().toUpperCase();
+  const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
+
+  const urlCtx = parseUrlHashContext();
+  if (urlCtx.hashSecret) {
+    roomHashSecretStore.set(cleanRoom, urlCtx.hashSecret);
+    if (cleanPeer) roomHashSecretStore.set(cleanPeer, urlCtx.hashSecret);
+    saveRoomHashSecrets();
+    return urlCtx.hashSecret;
+  }
+
+  const existing =
+    roomHashSecretStore.get(cleanRoom) ||
+    (cleanPeer ? roomHashSecretStore.get(cleanPeer) : undefined) ||
+    roomHashSecretStore.get('DEFAULT');
+
+  if (existing) {
+    if (typeof window !== 'undefined' && cleanRoom !== 'GLOBAL' && cleanPeer) {
+      try {
+        window.history.replaceState(
+          null,
+          '',
+          `${window.location.pathname}${window.location.search}#peer=${encodeURIComponent(cleanPeer)}&key=${encodeURIComponent(existing)}`
+        );
+      } catch {
+        // ignore
+      }
+    }
+    return existing;
+  }
+
+  // Generate fresh deterministic-compatible or random URL hash key for invite URL sharing
+  const randomBytes = new Uint8Array(12);
+  window.crypto.getRandomValues(randomBytes);
+  const generatedSecret = Array.from(randomBytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  roomHashSecretStore.set(cleanRoom, generatedSecret);
+  if (cleanPeer) roomHashSecretStore.set(cleanPeer, generatedSecret);
+  saveRoomHashSecrets();
+
+  if (typeof window !== 'undefined' && cleanRoom !== 'GLOBAL' && cleanPeer) {
+    try {
+      window.history.replaceState(
+        null,
+        '',
+        `${window.location.pathname}${window.location.search}#peer=${encodeURIComponent(cleanPeer)}&key=${encodeURIComponent(generatedSecret)}`
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  return generatedSecret;
+}
 
 export function resetMyEcdhIdentity(): void {
   cachedMyKeyPair = null;
@@ -30,6 +160,20 @@ export function resetMyEcdhIdentity(): void {
     sessionStorage.removeItem(ECDH_IDENTITY_STORAGE_KEY);
   } catch {
     // ignore
+  }
+}
+
+export function purgeRoomCryptoSession(roomId: string): void {
+  const cleanRoom = roomId.trim().toUpperCase();
+  for (const key of Array.from(derivedRoomKeyCache.keys())) {
+    if (key.startsWith(`${cleanRoom}::`)) {
+      derivedRoomKeyCache.delete(key);
+    }
+  }
+  for (const key of Array.from(decryptedPayloadCache.keys())) {
+    if (key.startsWith(`${roomId}::`) || key.startsWith(`${cleanRoom}::`)) {
+      decryptedPayloadCache.delete(key);
+    }
   }
 }
 
@@ -158,20 +302,53 @@ function base64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
-// Derive an AES-256-GCM CryptoKey for a room (ECDH shared secret if peer key is present, or PBKDF2 room key)
+// Derive an AES-256-GCM CryptoKey for a room (URL #hash key, ECDH shared secret, or PBKDF2 room key)
 async function getRoomAesGcmKey(
   roomId: string,
-  mode: 'ecdh' | 'deterministic',
-  peerId?: string
+  mode: 'hash' | 'ecdh' | 'deterministic',
+  peerId?: string,
+  explicitHashSecret?: string
 ): Promise<CryptoKey> {
   const cleanRoomId = roomId.trim().toUpperCase();
   const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
-  const cacheId = `${cleanRoomId}::${mode}::${cleanPeer}`;
+  const hashSecret =
+    explicitHashSecret ||
+    roomHashSecretStore.get(cleanRoomId) ||
+    (cleanPeer ? roomHashSecretStore.get(cleanPeer) : undefined) ||
+    roomHashSecretStore.get('DEFAULT') ||
+    '';
+  const cacheId = `${cleanRoomId}::${mode}::${cleanPeer}::${mode === 'hash' ? hashSecret : ''}`;
 
   const existing = derivedRoomKeyCache.get(cacheId);
   if (existing) return existing;
 
   const encoder = new TextEncoder();
+
+  if (mode === 'hash' && hashSecret) {
+    const hashKeyMaterial = await window.crypto.subtle.importKey(
+      'raw',
+      encoder.encode(`URL-HASH-KEY::${cleanRoomId}::${hashSecret}::${APP_CRYPTO_PEPPER}`),
+      { name: 'PBKDF2' },
+      false,
+      ['deriveKey']
+    );
+
+    const hashAesKey = await window.crypto.subtle.deriveKey(
+      {
+        name: 'PBKDF2',
+        salt: encoder.encode(`WHISPERNET-HASH-SALT::${cleanRoomId}`),
+        iterations: 65000,
+        hash: 'SHA-256',
+      },
+      hashKeyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+
+    derivedRoomKeyCache.set(cacheId, hashAesKey);
+    return hashAesKey;
+  }
 
   if (mode === 'ecdh' && cleanPeer) {
     const peerPubJwkStr = peerPublicKeyStore.get(cleanPeer);
@@ -248,6 +425,27 @@ async function getRoomAesGcmKey(
   return deterministicKey;
 }
 
+// Automatically derive and warm up a temporary cryptographic session key in-browser upon joining a room
+export async function initializeRoomSessionKey(
+  roomId: string,
+  peerId?: string
+): Promise<void> {
+  const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
+  if (roomId !== 'GLOBAL') {
+    const hashSecret = bootstrapRoomUrlHashSecret(roomId, cleanPeer);
+    if (hashSecret) {
+      await getRoomAesGcmKey(roomId, 'hash', cleanPeer, hashSecret);
+    }
+  }
+  const hasPeerEcdh = Boolean(
+    cleanPeer && roomId !== 'GLOBAL' && peerPublicKeyStore.has(cleanPeer)
+  );
+  if (hasPeerEcdh) {
+    await getRoomAesGcmKey(roomId, 'ecdh', cleanPeer);
+  }
+  await getRoomAesGcmKey(roomId, 'deterministic', cleanPeer);
+}
+
 // Encrypt plaintext on the client using AES-256-GCM before network transmission
 export async function encryptMessageContent(
   plaintext: string,
@@ -315,6 +513,26 @@ export async function decryptMessageContent(
 
     const iv = base64ToBytes(ivB64);
     const cipherBytes = base64ToBytes(cipherB64);
+
+    if (modeFlag === 'H') {
+      try {
+        const hashKey = await getRoomAesGcmKey(roomId, 'hash', cleanPeer);
+        const decryptedBuffer = await window.crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv },
+          hashKey,
+          cipherBytes
+        );
+        const decoded = new TextDecoder().decode(decryptedBuffer);
+        if (decryptedPayloadCache.size > 600) {
+          const firstKey = decryptedPayloadCache.keys().next().value;
+          if (firstKey) decryptedPayloadCache.delete(firstKey);
+        }
+        decryptedPayloadCache.set(cacheKey, decoded);
+        return decoded;
+      } catch {
+        // Fallback attempt with ECDH or deterministic room key
+      }
+    }
 
     if (modeFlag === 'E' && cleanPeer) {
       try {
