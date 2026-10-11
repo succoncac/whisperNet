@@ -4,7 +4,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createClient } from '@libsql/client';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -12,18 +11,8 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const TURSO_URL =
-  process.env.TURSO_DATABASE_URL || 'libsql://chat-fyfg.aws-ap-northeast-1.turso.io';
-const TURSO_TOKEN =
-  process.env.TURSO_AUTH_TOKEN ||
-  'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTE2ODU4NzcsImlkIjoiMDFhMTI4Y2MtNTYwMS03NTZmLWE2MDctYWUwYjdlYzEzYmQ2Iiwia2lkIjoiMW5DMG9zdWs0b3B6aTRIVnB4aHVOSjVtaklGdUFuVnRXU1NmQXhhbmJlbyIsInJpZCI6ImQ1YWU1YmJmLThmZDItNGMzOC04Y2I2LTAyZDhmODQ2MDEyYSJ9.kVim6rlvy-fHa1PdwK2Hvqw6Pv_j244Ujp587dYJtwM0-QEgSaR6Fbpxv-tY7ZejVDHAmLH6eVeYC73LnUSMCQ';
-
-const db = createClient({
-  url: TURSO_URL,
-  authToken: TURSO_TOKEN,
-});
-
-const TTL_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
+// 1-Hour Ephemeral TTL in milliseconds (Pure In-Memory Ephemeral RAM Storage Only)
+const TTL_MS = 60 * 60 * 1000;
 const GLOBAL_ROOM_ID = 'GLOBAL';
 
 export type ReactionMap = Record<string, string[]>;
@@ -36,6 +25,37 @@ export interface MessageRowFormatted {
   timestamp: number;
   reactions: ReactionMap;
 }
+
+interface InMemoryRoom {
+  room_id: string;
+  created_at: number;
+}
+
+interface InMemoryMessage {
+  id: string;
+  room_id: string;
+  sender_id: string;
+  content: string;
+  timestamp: number;
+}
+
+interface InMemoryActiveUser {
+  user_id: string;
+  last_seen: number;
+  public_key: string | null;
+}
+
+interface InMemoryReactionRecord {
+  roomId: string;
+  timestamp: number;
+  reactions: Map<string, Set<string>>;
+}
+
+// Pure In-Memory Ephemeral RAM Storage (Zero Persistent Disk Writes)
+const memoryRooms = new Map<string, InMemoryRoom>();
+const memoryMessages = new Map<string, InMemoryMessage[]>();
+const memoryActiveUsers = new Map<string, InMemoryActiveUser>();
+const memoryMessageReactions = new Map<string, InMemoryReactionRecord>();
 
 export function normalizeCode(code: string): string {
   return String(code || '')
@@ -58,202 +78,61 @@ export function extractPeerFromRoomId(roomId: string, myId: string): string | nu
   return null;
 }
 
-async function ensureGlobalRoomExists(): Promise<void> {
-  const now = Date.now();
-  const check = await db.execute({
-    sql: 'SELECT room_id FROM rooms WHERE room_id = ?',
-    args: [GLOBAL_ROOM_ID],
-  });
-  if (check.rows.length === 0) {
-    await db.execute({
-      sql: 'INSERT INTO rooms (room_id, created_at) VALUES (?, ?)',
-      args: [GLOBAL_ROOM_ID, now],
+function ensureGlobalRoomExists(): void {
+  if (!memoryRooms.has(GLOBAL_ROOM_ID)) {
+    memoryRooms.set(GLOBAL_ROOM_ID, {
+      room_id: GLOBAL_ROOM_ID,
+      created_at: Date.now(),
     });
+  }
+  if (!memoryMessages.has(GLOBAL_ROOM_ID)) {
+    memoryMessages.set(GLOBAL_ROOM_ID, []);
   }
 }
 
-async function registerActiveIdentity(userId: string, publicKey?: string): Promise<void> {
+function registerActiveIdentity(userId: string, publicKey?: string): void {
   const cleanId = normalizeCode(userId);
   if (!cleanId || cleanId.length < 4) return;
   const now = Date.now();
-  try {
-    if (publicKey && typeof publicKey === 'string') {
-      await db.execute({
-        sql: `
-          INSERT INTO active_users (user_id, last_seen, public_key)
-          VALUES (?, ?, ?)
-          ON CONFLICT(user_id) DO UPDATE SET
-            last_seen = excluded.last_seen,
-            public_key = COALESCE(excluded.public_key, active_users.public_key)
-        `,
-        args: [cleanId, now, publicKey],
-      });
-    } else {
-      await db.execute({
-        sql: `
-          INSERT INTO active_users (user_id, last_seen)
-          VALUES (?, ?)
-          ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen
-        `,
-        args: [cleanId, now],
-      });
-    }
-  } catch (err) {
-    console.error('Error registering active identity:', err);
-  }
+  const existing = memoryActiveUsers.get(cleanId);
+  memoryActiveUsers.set(cleanId, {
+    user_id: cleanId,
+    last_seen: now,
+    public_key:
+      publicKey && typeof publicKey === 'string'
+        ? publicKey
+        : existing?.public_key || null,
+  });
 }
 
-async function getPeerPublicKey(userId: string): Promise<string | null> {
+function getPeerPublicKey(userId: string): string | null {
   const cleanId = normalizeCode(userId);
   if (!cleanId) return null;
-  try {
-    const res = await db.execute({
-      sql: 'SELECT public_key FROM active_users WHERE user_id = ? LIMIT 1',
-      args: [cleanId],
-    });
-    const val = res.rows[0]?.public_key;
-    return val ? String(val) : null;
-  } catch {
-    return null;
-  }
+  const record = memoryActiveUsers.get(cleanId);
+  return record?.public_key ? String(record.public_key) : null;
 }
 
-async function initializeDatabase(): Promise<void> {
-  try {
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS rooms (
-        room_id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-      )
-    `);
-
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        room_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        content TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-      )
-    `);
-
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS active_users (
-        user_id TEXT PRIMARY KEY,
-        last_seen INTEGER NOT NULL,
-        public_key TEXT
-      )
-    `);
-
-    try {
-      await db.execute(`ALTER TABLE active_users ADD COLUMN public_key TEXT`);
-    } catch {
-      // Column already exists
-    }
-
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS message_reactions (
-        message_id TEXT NOT NULL,
-        room_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        emoji TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        PRIMARY KEY (message_id, user_id, emoji)
-      )
-    `);
-
-    await db.execute(`
-      CREATE INDEX IF NOT EXISTS idx_messages_room_timestamp ON messages (room_id, timestamp ASC)
-    `);
-
-    await db.execute(`
-      CREATE INDEX IF NOT EXISTS idx_reactions_room ON message_reactions (room_id, message_id)
-    `);
-
-    await ensureGlobalRoomExists();
-    await cleanupExpiredData();
-  } catch (err) {
-    console.error('Database initialization error:', err);
-  }
-}
-
-async function cleanupExpiredData(): Promise<{ deletedMessages: number; deletedRooms: number }> {
-  const cutoff = Date.now() - TTL_MS;
-  try {
-    const msgRes = await db.execute({
-      sql: 'DELETE FROM messages WHERE timestamp < ?',
-      args: [cutoff],
-    });
-    const roomRes = await db.execute({
-      sql: 'DELETE FROM rooms WHERE created_at < ? AND room_id != ?',
-      args: [cutoff, GLOBAL_ROOM_ID],
-    });
-    await db.execute({
-      sql: 'DELETE FROM active_users WHERE last_seen < ?',
-      args: [cutoff],
-    });
-    await db.execute({
-      sql: 'DELETE FROM message_reactions WHERE timestamp < ?',
-      args: [cutoff],
-    });
-    return {
-      deletedMessages: msgRes.rowsAffected || 0,
-      deletedRooms: roomRes.rowsAffected || 0,
-    };
-  } catch (err) {
-    console.error('TTL cleanup error:', err);
-    return { deletedMessages: 0, deletedRooms: 0 };
-  }
-}
-
-async function getReactionsForRoom(roomId: string, cutoff: number): Promise<Record<string, ReactionMap>> {
-  const mapByMessage: Record<string, ReactionMap> = {};
-  try {
-    const res = await db.execute({
-      sql: 'SELECT message_id, user_id, emoji FROM message_reactions WHERE room_id = ? AND timestamp >= ?',
-      args: [roomId, cutoff],
-    });
-    for (const row of res.rows) {
-      const msgId = String(row.message_id);
-      const userId = String(row.user_id);
-      const emoji = String(row.emoji);
-      if (!mapByMessage[msgId]) {
-        mapByMessage[msgId] = {};
-      }
-      if (!mapByMessage[msgId][emoji]) {
-        mapByMessage[msgId][emoji] = [];
-      }
-      if (!mapByMessage[msgId][emoji].includes(userId)) {
-        mapByMessage[msgId][emoji].push(userId);
-      }
-    }
-  } catch (err) {
-    console.error('Error loading room reactions:', err);
-  }
-  return mapByMessage;
-}
-
-async function getReactionsForMessage(messageId: string): Promise<ReactionMap> {
+function getReactionsForMessage(messageId: string): ReactionMap {
   const reactionMap: ReactionMap = {};
-  try {
-    const res = await db.execute({
-      sql: 'SELECT user_id, emoji FROM message_reactions WHERE message_id = ?',
-      args: [messageId],
-    });
-    for (const row of res.rows) {
-      const userId = String(row.user_id);
-      const emoji = String(row.emoji);
-      if (!reactionMap[emoji]) {
-        reactionMap[emoji] = [];
-      }
-      if (!reactionMap[emoji].includes(userId)) {
-        reactionMap[emoji].push(userId);
-      }
+  const entry = memoryMessageReactions.get(messageId);
+  if (!entry) return reactionMap;
+  for (const [emoji, usersSet] of entry.reactions.entries()) {
+    const arr = Array.from(usersSet);
+    if (arr.length > 0) {
+      reactionMap[emoji] = arr;
     }
-  } catch (err) {
-    console.error('Error loading message reactions:', err);
   }
   return reactionMap;
+}
+
+function getReactionsForRoom(roomId: string, cutoff: number): Record<string, ReactionMap> {
+  const mapByMessage: Record<string, ReactionMap> = {};
+  for (const [msgId, entry] of memoryMessageReactions.entries()) {
+    if (entry.roomId === roomId && entry.timestamp >= cutoff) {
+      mapByMessage[msgId] = getReactionsForMessage(msgId);
+    }
+  }
+  return mapByMessage;
 }
 
 interface WsClient extends WebSocket {
@@ -262,12 +141,7 @@ interface WsClient extends WebSocket {
 }
 
 async function startServer() {
-  await initializeDatabase();
-
-  // Periodic 24-hour TTL auto-cleanup every 5 minutes
-  setInterval(() => {
-    cleanupExpiredData().catch(() => {});
-  }, 5 * 60 * 1000);
+  ensureGlobalRoomExists();
 
   const app = express();
   app.set('trust proxy', 1);
@@ -290,6 +164,11 @@ async function startServer() {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
+    if (req.path.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+    }
     if (req.method === 'OPTIONS') {
       res.status(200).json({ ok: true });
       return;
@@ -302,6 +181,69 @@ async function startServer() {
   const roomClients = new Map<string, Set<WsClient>>();
   const userClients = new Map<string, Set<WsClient>>();
   const allClients = new Set<WsClient>();
+
+  function isUserCurrentlyOnline(userId: string): boolean {
+    const cleanUserId = normalizeCode(userId);
+    const set = userClients.get(cleanUserId);
+    if (!set) return false;
+    for (const c of set) {
+      if (c.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
+  }
+
+  function cleanupExpiredData(): { deletedMessages: number; deletedRooms: number } {
+    const cutoff = Date.now() - TTL_MS;
+    let deletedMessages = 0;
+    let deletedRooms = 0;
+
+    for (const [roomId, msgList] of memoryMessages.entries()) {
+      const validMsgs: InMemoryMessage[] = [];
+      for (const msg of msgList) {
+        if (msg.timestamp >= cutoff) {
+          validMsgs.push(msg);
+        } else {
+          deletedMessages++;
+          memoryMessageReactions.delete(msg.id);
+        }
+      }
+      if (validMsgs.length !== msgList.length) {
+        memoryMessages.set(roomId, validMsgs);
+      }
+    }
+
+    for (const [roomId, roomObj] of memoryRooms.entries()) {
+      if (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff) {
+        deletedRooms++;
+        memoryRooms.delete(roomId);
+        const roomMsgs = memoryMessages.get(roomId) || [];
+        for (const m of roomMsgs) {
+          memoryMessageReactions.delete(m.id);
+        }
+        memoryMessages.delete(roomId);
+      }
+    }
+
+    for (const [userId, userObj] of memoryActiveUsers.entries()) {
+      if (userObj.last_seen < cutoff && !isUserCurrentlyOnline(userId)) {
+        memoryActiveUsers.delete(userId);
+      }
+    }
+
+    for (const [msgId, reactEntry] of memoryMessageReactions.entries()) {
+      if (reactEntry.timestamp < cutoff) {
+        memoryMessageReactions.delete(msgId);
+      }
+    }
+
+    ensureGlobalRoomExists();
+    return { deletedMessages, deletedRooms };
+  }
+
+  // Periodic 1-hour TTL in-memory auto-cleanup every 30 seconds
+  setInterval(() => {
+    cleanupExpiredData();
+  }, 30 * 1000);
 
   function broadcastToAll(payload: Record<string, unknown>) {
     const messageStr = JSON.stringify(payload);
@@ -339,59 +281,71 @@ async function startServer() {
     }
   }
 
-  function isUserCurrentlyOnline(userId: string): boolean {
-    const cleanUserId = normalizeCode(userId);
-    const set = userClients.get(cleanUserId);
-    if (!set) return false;
-    for (const c of set) {
-      if (c.readyState === WebSocket.OPEN) return true;
-    }
-    return false;
-  }
-
-  async function doesUserExistOrOnline(targetUserId: string, requesterId: string): Promise<boolean> {
+  function doesUserExistOrOnline(targetUserId: string): boolean {
     const cleanTarget = normalizeCode(targetUserId);
-    const cleanRequester = normalizeCode(requesterId);
     if (!cleanTarget || cleanTarget.length < 4) return false;
-
-    // 1. Check active WebSocket presence
-    if (isUserCurrentlyOnline(cleanTarget)) {
-      return true;
-    }
-
+    if (isUserCurrentlyOnline(cleanTarget)) return true;
     const cutoff = Date.now() - TTL_MS;
-
-    // 2. Check active_users session table in Turso (active within 24h TTL)
-    const activeCheck = await db.execute({
-      sql: 'SELECT user_id FROM active_users WHERE user_id = ? AND last_seen >= ? LIMIT 1',
-      args: [cleanTarget, cutoff],
-    });
-    if (activeCheck.rows.length > 0) return true;
-
-    // 3. Check if user has posted any message in Turso within 24h TTL
-    const msgCheck = await db.execute({
-      sql: 'SELECT id FROM messages WHERE sender_id = ? AND timestamp >= ? LIMIT 1',
-      args: [cleanTarget, cutoff],
-    });
-    if (msgCheck.rows.length > 0) return true;
-
-    // 4. Check if a room with this peer already exists in Turso
-    const candidateRoomId = buildRoomId(cleanRequester, cleanTarget);
-    const roomCheck = await db.execute({
-      sql: 'SELECT room_id FROM rooms WHERE room_id = ? AND created_at >= ? LIMIT 1',
-      args: [candidateRoomId, cutoff],
-    });
-    if (roomCheck.rows.length > 0) return true;
-
-    return false;
+    const record = memoryActiveUsers.get(cleanTarget);
+    return Boolean(record && record.last_seen >= cutoff);
   }
 
-  function registerUserSocket(ws: WsClient, rawUserId: string) {
+  function severStaleIdentity(staleUserId: string) {
+    const cleanStale = normalizeCode(staleUserId);
+    if (!cleanStale) return;
+
+    // 1. Sever any open WebSockets still attached to the old/deleted identity
+    const oldSet = userClients.get(cleanStale);
+    if (oldSet) {
+      for (const client of Array.from(oldSet)) {
+        try {
+          client.close(4001, 'Identity superseded or cleared');
+        } catch {
+          // ignore
+        }
+        allClients.delete(client);
+      }
+      userClients.delete(cleanStale);
+    }
+
+    // 2. Delete old identity from in-memory active users immediately
+    memoryActiveUsers.delete(cleanStale);
+
+    // 3. Notify all active 1-on-1 private rooms involving the old identity
+    const cutoff = Date.now() - TTL_MS;
+    for (const [roomId, roomObj] of memoryRooms.entries()) {
+      if (roomId === GLOBAL_ROOM_ID || roomObj.created_at < cutoff) continue;
+      if (roomId.startsWith(`${cleanStale}__`) || roomId.endsWith(`__${cleanStale}`)) {
+        const peerId = extractPeerFromRoomId(roomId, cleanStale);
+        const payload = {
+          type: 'USER_LEFT',
+          event: 'USER_DISCONNECTED',
+          roomId,
+          userId: cleanStale,
+          peerAlive: false,
+          reason: 'Partner disconnected / left the channel',
+          timestamp: Date.now(),
+        };
+        broadcastToRoom(roomId, payload);
+        if (peerId) {
+          sendToUser(peerId, payload);
+        }
+      }
+    }
+
+    broadcastGlobalPresence();
+  }
+
+  function registerUserSocket(ws: WsClient, rawUserId: string, publicKey?: string) {
     const cleanUserId = normalizeCode(rawUserId);
     if (!cleanUserId) return;
 
-    if (ws.userId && ws.userId !== cleanUserId && userClients.has(ws.userId)) {
-      userClients.get(ws.userId)?.delete(ws);
+    if (ws.userId && ws.userId !== cleanUserId) {
+      const previousId = ws.userId;
+      if (userClients.has(previousId)) {
+        userClients.get(previousId)?.delete(ws);
+      }
+      severStaleIdentity(previousId);
     }
 
     ws.userId = cleanUserId;
@@ -399,7 +353,7 @@ async function startServer() {
       userClients.set(cleanUserId, new Set());
     }
     userClients.get(cleanUserId)!.add(ws);
-    registerActiveIdentity(cleanUserId).catch(() => {});
+    registerActiveIdentity(cleanUserId, publicKey);
   }
 
   function broadcastGlobalPresence() {
@@ -441,8 +395,15 @@ async function startServer() {
       try {
         const data = JSON.parse(String(raw));
 
-        if (data.type === 'user:identify' && data.userId) {
-          registerUserSocket(ws, data.userId);
+        if (data.type === 'ping') {
+          if (ws.userId) {
+            registerActiveIdentity(ws.userId);
+          }
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+          }
+        } else if (data.type === 'user:identify' && data.userId) {
+          registerUserSocket(ws, data.userId, data.publicKey);
           broadcastGlobalPresence();
         } else if (data.type === 'room:join' && data.roomId && data.userId) {
           if (ws.roomId && roomClients.has(ws.roomId)) {
@@ -450,7 +411,7 @@ async function startServer() {
             broadcastRoomPresence(ws.roomId);
           }
           const cleanRoomId = String(data.roomId);
-          registerUserSocket(ws, data.userId);
+          registerUserSocket(ws, data.userId, data.publicKey);
           ws.roomId = cleanRoomId;
 
           if (!roomClients.has(cleanRoomId)) {
@@ -467,6 +428,19 @@ async function startServer() {
             userId: ws.userId,
             isTyping: Boolean(data.isTyping),
           });
+        } else if (data.type === 'webrtc:signal' && data.targetUserId && ws.userId) {
+          // Non-Intrusive Hybrid WebRTC P2P Signaling Relay (Offer / Answer / ICE Candidate)
+          const targetPeer = normalizeCode(String(data.targetUserId));
+          sendToUser(targetPeer, {
+            type: 'webrtc:signal',
+            roomId: String(data.roomId || ''),
+            fromUserId: ws.userId,
+            targetUserId: targetPeer,
+            signalType: String(data.signalType || ''),
+            sdp: data.sdp || null,
+            candidate: data.candidate || null,
+            timestamp: Date.now(),
+          });
         }
       } catch {
         // Ignore malformed WS packets
@@ -475,22 +449,49 @@ async function startServer() {
 
     ws.on('close', () => {
       allClients.delete(ws);
-      if (ws.userId && userClients.has(ws.userId)) {
-        const uSet = userClients.get(ws.userId)!;
+      const closedUserId = ws.userId;
+      const closedRoomId = ws.roomId;
+      let userStillHasOpenSockets = false;
+
+      if (closedUserId && userClients.has(closedUserId)) {
+        const uSet = userClients.get(closedUserId)!;
         uSet.delete(ws);
         if (uSet.size === 0) {
-          userClients.delete(ws.userId);
+          userClients.delete(closedUserId);
+        } else {
+          userStillHasOpenSockets = true;
         }
       }
-      if (ws.roomId && roomClients.has(ws.roomId)) {
-        const set = roomClients.get(ws.roomId)!;
+
+      if (closedRoomId && roomClients.has(closedRoomId)) {
+        const set = roomClients.get(closedRoomId)!;
         set.delete(ws);
         if (set.size === 0) {
-          roomClients.delete(ws.roomId);
+          roomClients.delete(closedRoomId);
         } else {
-          broadcastRoomPresence(ws.roomId);
+          broadcastRoomPresence(closedRoomId);
         }
       }
+
+      if (closedUserId && !userStillHasOpenSockets) {
+        if (closedRoomId && closedRoomId !== GLOBAL_ROOM_ID) {
+          const peerId = extractPeerFromRoomId(closedRoomId, closedUserId);
+          const disconnectPayload = {
+            type: 'USER_DISCONNECTED',
+            event: 'USER_LEFT',
+            roomId: closedRoomId,
+            userId: closedUserId,
+            peerAlive: false,
+            reason: 'Partner disconnected / left the channel',
+            timestamp: Date.now(),
+          };
+          broadcastToRoom(closedRoomId, disconnectPayload);
+          if (peerId) {
+            sendToUser(peerId, disconnectPayload);
+          }
+        }
+      }
+
       broadcastGlobalPresence();
     });
   });
@@ -505,29 +506,20 @@ async function startServer() {
     return `USER-${suffix}`;
   }
 
-  async function isUserIdTakenByAnotherSession(candidateId: string): Promise<boolean> {
-    if (isUserCurrentlyOnline(candidateId)) {
-      return true;
-    }
+  function isUserIdTakenByAnotherSession(candidateId: string): boolean {
+    if (isUserCurrentlyOnline(candidateId)) return true;
     const cutoff = Date.now() - TTL_MS;
-    const res = await db.execute({
-      sql: 'SELECT user_id FROM active_users WHERE user_id = ? AND last_seen >= ? LIMIT 1',
-      args: [candidateId, cutoff],
-    });
-    return res.rows.length > 0;
+    const record = memoryActiveUsers.get(candidateId);
+    return Boolean(record && record.last_seen >= cutoff);
   }
 
-  async function assignUniqueUserId(
+  function assignUniqueUserId(
     requestedId?: string,
     isExistingSession?: boolean
-  ): Promise<{ userId: string; collisionResolved: boolean }> {
+  ): { userId: string; collisionResolved: boolean } {
     const cleanRequested = normalizeCode(requestedId || '');
     if (cleanRequested && /^USER-[A-Z0-9]{4,6}$/.test(cleanRequested)) {
-      if (isExistingSession) {
-        return { userId: cleanRequested, collisionResolved: false };
-      }
-      const taken = await isUserIdTakenByAnotherSession(cleanRequested);
-      if (!taken) {
+      if (isExistingSession || !isUserIdTakenByAnotherSession(cleanRequested)) {
         return { userId: cleanRequested, collisionResolved: false };
       }
     }
@@ -537,8 +529,7 @@ async function startServer() {
     for (const len of lengthsToTry) {
       for (let attempt = 0; attempt < 8; attempt++) {
         const candidate = generateRandomUserId(len);
-        const taken = await isUserIdTakenByAnotherSession(candidate);
-        if (!taken) {
+        if (!isUserIdTakenByAnotherSession(candidate)) {
           return {
             userId: candidate,
             collisionResolved: Boolean(cleanRequested && candidate !== cleanRequested),
@@ -547,24 +538,29 @@ async function startServer() {
       }
     }
 
-    const fallback6 = generateRandomUserId(6);
-    return { userId: fallback6, collisionResolved: true };
+    return { userId: generateRandomUserId(6), collisionResolved: true };
   }
 
   // Register/Heartbeat User Identity + Collision Check & Retry Scaling (4 -> 5 -> 6 chars)
-  app.post('/api/users/register', async (req, res) => {
+  app.post('/api/users/register', (req, res) => {
     try {
-      await cleanupExpiredData();
+      cleanupExpiredData();
       const requestedId = normalizeCode(req.body?.userId);
+      const previousUserId = normalizeCode(req.body?.previousUserId);
       const isExistingSession = Boolean(req.body?.isExistingSession);
       const publicKey = req.body?.publicKey ? String(req.body.publicKey) : undefined;
 
-      const { userId, collisionResolved } = await assignUniqueUserId(
-        requestedId,
-        isExistingSession
-      );
+      if (previousUserId && previousUserId !== requestedId) {
+        severStaleIdentity(previousUserId);
+      }
 
-      await registerActiveIdentity(userId, publicKey);
+      const { userId, collisionResolved } = assignUniqueUserId(requestedId, isExistingSession);
+
+      if (requestedId && userId !== requestedId) {
+        severStaleIdentity(requestedId);
+      }
+
+      registerActiveIdentity(userId, publicKey);
       res.status(200).json({
         ok: true,
         userId,
@@ -579,123 +575,87 @@ async function startServer() {
     }
   });
 
-  // Health & TTL Status Endpoint
-  app.get('/api/status', async (_req, res) => {
+  // Explicit Leave / Sever Identity Endpoint
+  app.post('/api/users/leave', (req, res) => {
     try {
-      const cleanup = await cleanupExpiredData();
-      const roomsCountResult = await db.execute({
-        sql: 'SELECT COUNT(*) as count FROM rooms WHERE room_id != ?',
-        args: [GLOBAL_ROOM_ID],
-      });
-      const messagesCountResult = await db.execute('SELECT COUNT(*) as count FROM messages');
-      const activeRooms = Number(roomsCountResult.rows[0]?.count ?? 0);
-      const activeMessages = Number(messagesCountResult.rows[0]?.count ?? 0);
-
-      res.status(200).json({
-        ok: true,
-        database: 'connected',
-        ttlHours: 24,
-        activeRooms,
-        activeMessages,
-        cleanedUp: cleanup,
-        timestamp: Date.now(),
-      });
-    } catch (error) {
-      res.status(500).json({
-        ok: false,
-        database: 'error',
-        error: error instanceof Error ? error.message : 'Database connection failed',
-      });
+      const userId = normalizeCode(req.body?.userId);
+      if (userId) {
+        severStaleIdentity(userId);
+      }
+      res.status(200).json({ ok: true });
+    } catch {
+      res.status(200).json({ ok: true });
     }
   });
 
+  // Health & Ephemeral RAM Status Endpoint
+  app.get('/api/status', (_req, res) => {
+    const cleanup = cleanupExpiredData();
+    let totalMessages = 0;
+    for (const list of memoryMessages.values()) {
+      totalMessages += list.length;
+    }
+    res.status(200).json({
+      ok: true,
+      storageMode: 'in-memory-ephemeral-ram',
+      ttlHours: 1,
+      activeRooms: Math.max(0, memoryRooms.size - 1),
+      activeMessages: totalMessages,
+      cleanedUp: cleanup,
+      timestamp: Date.now(),
+    });
+  });
+
   // Get All Active 1-on-1 Private Conversations for a User
-  app.get('/api/users/:userId/conversations', async (req, res) => {
+  app.get('/api/users/:userId/conversations', (req, res) => {
     try {
-      await cleanupExpiredData();
+      cleanupExpiredData();
       const myId = normalizeCode(req.params.userId);
       if (!myId) {
         res.status(400).json({ ok: false, error: 'Valid User ID is required.' });
         return;
       }
 
-      await registerActiveIdentity(myId);
-
-      const prefixPattern = `${myId}__%`;
-      const suffixPattern = `%__${myId}`;
+      registerActiveIdentity(myId);
       const cutoff = Date.now() - TTL_MS;
-
-      const roomsResult = await db.execute({
-        sql: `
-          SELECT room_id, created_at
-          FROM rooms
-          WHERE (room_id LIKE ? OR room_id LIKE ?)
-            AND created_at >= ?
-          ORDER BY created_at DESC
-        `,
-        args: [prefixPattern, suffixPattern, cutoff],
-      });
-
       const conversations = [];
 
-      for (const row of roomsResult.rows) {
-        const roomId = String(row.room_id);
-        const createdAt = Number(row.created_at);
+      for (const [roomId, roomObj] of memoryRooms.entries()) {
+        if (roomId === GLOBAL_ROOM_ID || roomObj.created_at < cutoff) continue;
+        if (!roomId.startsWith(`${myId}__`) && !roomId.endsWith(`__${myId}`)) continue;
+
+        const createdAt = Number(roomObj.created_at);
         const peerId = extractPeerFromRoomId(roomId, myId);
         if (!peerId) continue;
 
-        const lastMsgRes = await db.execute({
-          sql: `
-            SELECT id, sender_id, content, timestamp
-            FROM messages
-            WHERE room_id = ? AND timestamp >= ?
-            ORDER BY timestamp DESC
-            LIMIT 1
-          `,
-          args: [roomId, cutoff],
-        });
-
-        const countRes = await db.execute({
-          sql: `
-            SELECT COUNT(*) as count
-            FROM messages
-            WHERE room_id = ? AND timestamp >= ?
-          `,
-          args: [roomId, cutoff],
-        });
-
-        const lastMsgRow = lastMsgRes.rows[0];
-        const lastMessage = lastMsgRow
+        const validMsgs = (memoryMessages.get(roomId) || []).filter(
+          (m) => m.timestamp >= cutoff
+        );
+        const lastRaw = validMsgs.length > 0 ? validMsgs[validMsgs.length - 1] : null;
+        const lastMessage = lastRaw
           ? {
-              id: String(lastMsgRow.id),
-              sender_id: String(lastMsgRow.sender_id),
-              content: String(lastMsgRow.content),
-              timestamp: Number(lastMsgRow.timestamp),
+              id: String(lastRaw.id),
+              sender_id: String(lastRaw.sender_id),
+              content: String(lastRaw.content),
+              timestamp: Number(lastRaw.timestamp),
             }
           : null;
-
-        const peerPublicKey = await getPeerPublicKey(peerId);
 
         conversations.push({
           room_id: roomId,
           peer_id: peerId,
-          peer_public_key: peerPublicKey,
+          peer_public_key: getPeerPublicKey(peerId),
           created_at: createdAt,
           expires_at: createdAt + TTL_MS,
-          message_count: Number(countRes.rows[0]?.count ?? 0),
+          message_count: validMsgs.length,
           last_message: lastMessage,
           updated_at: lastMessage ? lastMessage.timestamp : createdAt,
         });
       }
 
       conversations.sort((a, b) => b.updated_at - a.updated_at);
-
-      res.status(200).json({
-        ok: true,
-        conversations,
-      });
+      res.status(200).json({ ok: true, conversations });
     } catch (error) {
-      console.error('Error fetching user conversations:', error);
       res.status(500).json({
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to fetch private conversations.',
@@ -703,32 +663,26 @@ async function startServer() {
     }
   });
 
-  // Get Global Public Chat Messages (Last 24h) + Reactions
-  app.get('/api/global/messages', async (_req, res) => {
+  // Get Global Public Chat Messages (Last 1h) + Reactions
+  app.get('/api/global/messages', (_req, res) => {
     try {
-      await cleanupExpiredData();
-      await ensureGlobalRoomExists();
+      cleanupExpiredData();
+      ensureGlobalRoomExists();
 
       const cutoff = Date.now() - TTL_MS;
-      const [messagesResult, reactionsByMsg] = await Promise.all([
-        db.execute({
-          sql: 'SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC LIMIT 200',
-          args: [GLOBAL_ROOM_ID, cutoff],
-        }),
-        getReactionsForRoom(GLOBAL_ROOM_ID, cutoff),
-      ]);
+      const rawMsgs = (memoryMessages.get(GLOBAL_ROOM_ID) || []).filter(
+        (m) => m.timestamp >= cutoff
+      );
+      const reactionsByMsg = getReactionsForRoom(GLOBAL_ROOM_ID, cutoff);
 
-      const messages: MessageRowFormatted[] = messagesResult.rows.map((row) => {
-        const msgId = String(row.id);
-        return {
-          id: msgId,
-          room_id: String(row.room_id),
-          sender_id: String(row.sender_id),
-          content: String(row.content),
-          timestamp: Number(row.timestamp),
-          reactions: reactionsByMsg[msgId] || {},
-        };
-      });
+      const messages: MessageRowFormatted[] = rawMsgs.slice(-200).map((row) => ({
+        id: String(row.id),
+        room_id: String(row.room_id),
+        sender_id: String(row.sender_id),
+        content: String(row.content),
+        timestamp: Number(row.timestamp),
+        reactions: reactionsByMsg[String(row.id)] || {},
+      }));
 
       res.status(200).json({
         ok: true,
@@ -736,7 +690,6 @@ async function startServer() {
         messages,
       });
     } catch (error) {
-      console.error('Error fetching global messages:', error);
       res.status(500).json({
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to fetch global chat messages.',
@@ -745,10 +698,10 @@ async function startServer() {
   });
 
   // Post a Message to Global Public Chat
-  app.post('/api/global/messages', async (req, res) => {
+  app.post('/api/global/messages', (req, res) => {
     try {
-      await cleanupExpiredData();
-      await ensureGlobalRoomExists();
+      cleanupExpiredData();
+      ensureGlobalRoomExists();
 
       const senderId = normalizeCode(req.body?.senderId);
       const content = String(req.body?.content || '').trim();
@@ -767,16 +720,14 @@ async function startServer() {
         return;
       }
 
-      await registerActiveIdentity(senderId);
+      registerActiveIdentity(senderId);
 
       const now = Date.now();
       const messageId =
         clientMsgId || `GLB-${now}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
 
-      const existingMsg = await db.execute({
-        sql: 'SELECT id FROM messages WHERE id = ?',
-        args: [messageId],
-      });
+      const roomList = memoryMessages.get(GLOBAL_ROOM_ID) || [];
+      const exists = roomList.some((m) => m.id === messageId);
 
       const messageRecord: MessageRowFormatted = {
         id: messageId,
@@ -787,17 +738,15 @@ async function startServer() {
         reactions: {},
       };
 
-      if (existingMsg.rows.length === 0) {
-        await db.execute({
-          sql: 'INSERT INTO messages (id, room_id, sender_id, content, timestamp) VALUES (?, ?, ?, ?, ?)',
-          args: [
-            messageRecord.id,
-            messageRecord.room_id,
-            messageRecord.sender_id,
-            messageRecord.content,
-            messageRecord.timestamp,
-          ],
+      if (!exists) {
+        roomList.push({
+          id: messageRecord.id,
+          room_id: messageRecord.room_id,
+          sender_id: messageRecord.sender_id,
+          content: messageRecord.content,
+          timestamp: messageRecord.timestamp,
         });
+        memoryMessages.set(GLOBAL_ROOM_ID, roomList);
 
         broadcastToAll({
           type: 'global:message:created',
@@ -810,8 +759,7 @@ async function startServer() {
         ok: true,
         message: messageRecord,
       });
-    } catch (error) {
-      console.error('Error posting global message:', error);
+    } catch {
       res.status(500).json({
         ok: false,
         error: 'Failed to store global message.',
@@ -819,10 +767,10 @@ async function startServer() {
     }
   });
 
-  // Connect or Create 1-on-1 Private Room (Validates if Target User ID exists / is active)
-  app.post('/api/rooms/connect', async (req, res) => {
+  // Connect or Create 1-on-1 Private Room
+  app.post('/api/rooms/connect', (req, res) => {
     try {
-      await cleanupExpiredData();
+      cleanupExpiredData();
 
       const myId = normalizeCode(req.body?.myId);
       const peerId = normalizeCode(req.body?.peerId);
@@ -848,11 +796,9 @@ async function startServer() {
       }
 
       const myPublicKey = req.body?.publicKey ? String(req.body.publicKey) : undefined;
-      await registerActiveIdentity(myId, myPublicKey);
+      registerActiveIdentity(myId, myPublicKey);
 
-      // Verify target peer exists in active session or database before creating room
-      const isPeerValid = await doesUserExistOrOnline(peerId, myId);
-      if (!isPeerValid) {
+      if (!doesUserExistOrOnline(peerId)) {
         res.status(404).json({
           ok: false,
           error: 'User not found. Please check the ID and try again.',
@@ -864,45 +810,29 @@ async function startServer() {
       const now = Date.now();
       const cutoff = now - TTL_MS;
 
-      const existingRoom = await db.execute({
-        sql: 'SELECT room_id, created_at FROM rooms WHERE room_id = ?',
-        args: [roomId],
-      });
-
-      let createdAt = now;
-      const isNewRoom = existingRoom.rows.length === 0;
-      if (isNewRoom) {
-        await db.execute({
-          sql: 'INSERT INTO rooms (room_id, created_at) VALUES (?, ?)',
-          args: [roomId, now],
-        });
-      } else {
-        createdAt = Number(existingRoom.rows[0].created_at);
+      let roomObj = memoryRooms.get(roomId);
+      const isNewRoom = !roomObj;
+      if (!roomObj) {
+        roomObj = { room_id: roomId, created_at: now };
+        memoryRooms.set(roomId, roomObj);
+        memoryMessages.set(roomId, []);
       }
 
-      const [messagesResult, reactionsByMsg, peerPublicKey, senderPublicKey] = await Promise.all([
-        db.execute({
-          sql: 'SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC',
-          args: [roomId, cutoff],
-        }),
-        getReactionsForRoom(roomId, cutoff),
-        getPeerPublicKey(peerId),
-        getPeerPublicKey(myId),
-      ]);
+      const createdAt = Number(roomObj.created_at);
+      const rawMsgs = (memoryMessages.get(roomId) || []).filter((m) => m.timestamp >= cutoff);
+      const reactionsByMsg = getReactionsForRoom(roomId, cutoff);
+      const peerPublicKey = getPeerPublicKey(peerId);
+      const senderPublicKey = getPeerPublicKey(myId);
 
-      const messages: MessageRowFormatted[] = messagesResult.rows.map((row) => {
-        const msgId = String(row.id);
-        return {
-          id: msgId,
-          room_id: String(row.room_id),
-          sender_id: String(row.sender_id),
-          content: String(row.content),
-          timestamp: Number(row.timestamp),
-          reactions: reactionsByMsg[msgId] || {},
-        };
-      });
+      const messages: MessageRowFormatted[] = rawMsgs.map((row) => ({
+        id: String(row.id),
+        room_id: String(row.room_id),
+        sender_id: String(row.sender_id),
+        content: String(row.content),
+        timestamp: Number(row.timestamp),
+        reactions: reactionsByMsg[String(row.id)] || {},
+      }));
 
-      // Notify peer in real time that User A initiated a private chat session
       if (notifyPeer) {
         sendToUser(peerId, {
           type: 'private:chat_request',
@@ -924,11 +854,11 @@ async function startServer() {
           expires_at: createdAt + TTL_MS,
           peer_id: peerId,
           peer_public_key: peerPublicKey,
+          peer_alive: true,
         },
         messages,
       });
-    } catch (error) {
-      console.error('Error connecting room:', error);
+    } catch {
       res.status(500).json({
         ok: false,
         error: 'Failed to initialize private room.',
@@ -937,21 +867,18 @@ async function startServer() {
   });
 
   // Get Private Room Messages & Verify Room Existence
-  app.get('/api/rooms/:roomId/messages', async (req, res) => {
+  app.get('/api/rooms/:roomId/messages', (req, res) => {
     try {
-      await cleanupExpiredData();
+      cleanupExpiredData();
       const roomId = String(req.params.roomId || '').trim();
       if (!roomId) {
         res.status(400).json({ ok: false, error: 'Room ID is required.' });
         return;
       }
 
-      const roomCheck = await db.execute({
-        sql: 'SELECT room_id, created_at FROM rooms WHERE room_id = ?',
-        args: [roomId],
-      });
-
-      if (roomCheck.rows.length === 0) {
+      const cutoff = Date.now() - TTL_MS;
+      const roomObj = memoryRooms.get(roomId);
+      if (!roomObj || (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff)) {
         res.status(200).json({
           ok: true,
           roomExists: false,
@@ -961,32 +888,27 @@ async function startServer() {
         return;
       }
 
-      const createdAt = Number(roomCheck.rows[0].created_at);
-      const cutoff = Date.now() - TTL_MS;
+      const createdAt = Number(roomObj.created_at);
+      const requesterId = normalizeCode(String(req.query.myId || ''));
+      const peerId = requesterId ? extractPeerFromRoomId(roomId, requesterId) : null;
+      const peerAlive = peerId ? doesUserExistOrOnline(peerId) : true;
 
-      const [messagesResult, reactionsByMsg] = await Promise.all([
-        db.execute({
-          sql: 'SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC',
-          args: [roomId, cutoff],
-        }),
-        getReactionsForRoom(roomId, cutoff),
-      ]);
+      const rawMsgs = (memoryMessages.get(roomId) || []).filter((m) => m.timestamp >= cutoff);
+      const reactionsByMsg = getReactionsForRoom(roomId, cutoff);
 
-      const messages: MessageRowFormatted[] = messagesResult.rows.map((row) => {
-        const msgId = String(row.id);
-        return {
-          id: msgId,
-          room_id: String(row.room_id),
-          sender_id: String(row.sender_id),
-          content: String(row.content),
-          timestamp: Number(row.timestamp),
-          reactions: reactionsByMsg[msgId] || {},
-        };
-      });
+      const messages: MessageRowFormatted[] = rawMsgs.map((row) => ({
+        id: String(row.id),
+        room_id: String(row.room_id),
+        sender_id: String(row.sender_id),
+        content: String(row.content),
+        timestamp: Number(row.timestamp),
+        reactions: reactionsByMsg[String(row.id)] || {},
+      }));
 
       res.status(200).json({
         ok: true,
         roomExists: true,
+        peerAlive,
         room: {
           room_id: roomId,
           created_at: createdAt,
@@ -995,7 +917,6 @@ async function startServer() {
         messages,
       });
     } catch (error) {
-      console.error('Error fetching messages:', error);
       res.status(500).json({
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to fetch room messages.',
@@ -1004,9 +925,9 @@ async function startServer() {
   });
 
   // Send a Private 1-on-1 Message
-  app.post('/api/rooms/:roomId/messages', async (req, res) => {
+  app.post('/api/rooms/:roomId/messages', (req, res) => {
     try {
-      await cleanupExpiredData();
+      cleanupExpiredData();
 
       const roomId = String(req.params.roomId || '').trim();
       const senderId = normalizeCode(req.body?.senderId);
@@ -1026,30 +947,28 @@ async function startServer() {
         return;
       }
 
-      await registerActiveIdentity(senderId);
+      const recipientId = extractPeerFromRoomId(roomId, senderId);
+      if (recipientId && !doesUserExistOrOnline(recipientId)) {
+        res.status(410).json({
+          ok: false,
+          peerDisconnected: true,
+          error: 'Partner disconnected / left the channel',
+        });
+        return;
+      }
+
+      registerActiveIdentity(senderId);
 
       const now = Date.now();
       const messageId =
         clientMsgId || `MSG-${now}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
 
-      // Ensure room exists
-      const roomCheck = await db.execute({
-        sql: 'SELECT room_id FROM rooms WHERE room_id = ?',
-        args: [roomId],
-      });
-
-      if (roomCheck.rows.length === 0) {
-        await db.execute({
-          sql: 'INSERT INTO rooms (room_id, created_at) VALUES (?, ?)',
-          args: [roomId, now],
-        });
+      if (!memoryRooms.has(roomId)) {
+        memoryRooms.set(roomId, { room_id: roomId, created_at: now });
       }
 
-      // Idempotency guard
-      const existingMsg = await db.execute({
-        sql: 'SELECT id FROM messages WHERE id = ?',
-        args: [messageId],
-      });
+      const roomList = memoryMessages.get(roomId) || [];
+      const exists = roomList.some((m) => m.id === messageId);
 
       const messageRecord: MessageRowFormatted = {
         id: messageId,
@@ -1060,17 +979,15 @@ async function startServer() {
         reactions: {},
       };
 
-      if (existingMsg.rows.length === 0) {
-        await db.execute({
-          sql: 'INSERT INTO messages (id, room_id, sender_id, content, timestamp) VALUES (?, ?, ?, ?, ?)',
-          args: [
-            messageRecord.id,
-            messageRecord.room_id,
-            messageRecord.sender_id,
-            messageRecord.content,
-            messageRecord.timestamp,
-          ],
+      if (!exists) {
+        roomList.push({
+          id: messageRecord.id,
+          room_id: messageRecord.room_id,
+          sender_id: messageRecord.sender_id,
+          content: messageRecord.content,
+          timestamp: messageRecord.timestamp,
         });
+        memoryMessages.set(roomId, roomList);
 
         broadcastToRoom(roomId, {
           type: 'message:created',
@@ -1078,9 +995,8 @@ async function startServer() {
           message: messageRecord,
         });
 
-        const recipientId = extractPeerFromRoomId(roomId, senderId);
         if (recipientId) {
-          const senderPublicKey = await getPeerPublicKey(senderId);
+          const senderPublicKey = getPeerPublicKey(senderId);
           sendToUser(recipientId, {
             type: 'private:message_notification',
             roomId,
@@ -1097,8 +1013,7 @@ async function startServer() {
         ok: true,
         message: messageRecord,
       });
-    } catch (error) {
-      console.error('Error sending message:', error);
+    } catch {
       res.status(500).json({
         ok: false,
         error: 'Failed to store private message.',
@@ -1107,40 +1022,43 @@ async function startServer() {
   });
 
   // Toggle or Add Reaction on any Message (Global or Private)
-  app.post('/api/messages/:messageId/reactions', async (req, res) => {
+  app.post('/api/messages/:messageId/reactions', (req, res) => {
     try {
       const messageId = String(req.params.messageId || '').trim();
       const roomId = String(req.body?.roomId || '').trim();
       const userId = normalizeCode(req.body?.userId);
       const emoji = String(req.body?.emoji || '').trim();
-      const mode = String(req.body?.mode || 'toggle'); // 'toggle' or 'add'
+      const mode = String(req.body?.mode || 'toggle');
 
       if (!messageId || !roomId || !userId || !emoji) {
         res.status(400).json({ ok: false, error: 'Missing reaction parameters.' });
         return;
       }
 
-      const existing = await db.execute({
-        sql: 'SELECT message_id FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?',
-        args: [messageId, userId, emoji],
-      });
+      const now = Date.now();
+      let entry = memoryMessageReactions.get(messageId);
+      if (!entry) {
+        entry = { roomId, timestamp: now, reactions: new Map() };
+        memoryMessageReactions.set(messageId, entry);
+      }
+      entry.timestamp = now;
 
-      if (existing.rows.length > 0) {
-        if (mode === 'toggle') {
-          await db.execute({
-            sql: 'DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?',
-            args: [messageId, userId, emoji],
-          });
-        }
-      } else {
-        await db.execute({
-          sql: 'INSERT INTO message_reactions (message_id, room_id, user_id, emoji, timestamp) VALUES (?, ?, ?, ?, ?)',
-          args: [messageId, roomId, userId, emoji, Date.now()],
-        });
+      let userSet = entry.reactions.get(emoji);
+      if (!userSet) {
+        userSet = new Set();
+        entry.reactions.set(emoji, userSet);
       }
 
-      const updatedReactions = await getReactionsForMessage(messageId);
+      if (userSet.has(userId) && mode === 'toggle') {
+        userSet.delete(userId);
+        if (userSet.size === 0) {
+          entry.reactions.delete(emoji);
+        }
+      } else {
+        userSet.add(userId);
+      }
 
+      const updatedReactions = getReactionsForMessage(messageId);
       const eventPayload = {
         type: 'message:reaction_updated',
         roomId,
@@ -1150,7 +1068,6 @@ async function startServer() {
 
       broadcastToRoom(roomId, eventPayload);
 
-      // If private room, also push to both participants directly
       if (roomId !== GLOBAL_ROOM_ID) {
         const peerId = extractPeerFromRoomId(roomId, userId);
         if (peerId) sendToUser(peerId, eventPayload);
@@ -1164,7 +1081,6 @@ async function startServer() {
         reactions: updatedReactions,
       });
     } catch (error) {
-      console.error('Error toggling reaction:', error);
       res.status(500).json({
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to update message reaction.',
@@ -1172,8 +1088,8 @@ async function startServer() {
     }
   });
 
-  // The "Nuke Chat" Endpoint - Permanently wipes private messages, reactions, and room record for both users
-  app.delete('/api/rooms/:roomId/nuke', async (req, res) => {
+  // The "Nuke Chat" Endpoint - Hard Wipes in-memory room messages and reactions for both users
+  app.delete('/api/rooms/:roomId/nuke', (req, res) => {
     try {
       const roomId = String(req.params.roomId || '').trim();
       const triggeredBy = normalizeCode(req.body?.triggeredBy || 'UNKNOWN');
@@ -1184,21 +1100,19 @@ async function startServer() {
       }
 
       const peerId = extractPeerFromRoomId(roomId, triggeredBy);
+      const roomMsgs = memoryMessages.get(roomId) || [];
+      const deletedCount = roomMsgs.length;
 
-      await db.execute({
-        sql: 'DELETE FROM message_reactions WHERE room_id = ?',
-        args: [roomId],
-      });
-
-      const deletedMessages = await db.execute({
-        sql: 'DELETE FROM messages WHERE room_id = ?',
-        args: [roomId],
-      });
-
-      const deletedRooms = await db.execute({
-        sql: 'DELETE FROM rooms WHERE room_id = ?',
-        args: [roomId],
-      });
+      for (const m of roomMsgs) {
+        memoryMessageReactions.delete(m.id);
+      }
+      for (const [msgId, entry] of memoryMessageReactions.entries()) {
+        if (entry.roomId === roomId) {
+          memoryMessageReactions.delete(msgId);
+        }
+      }
+      memoryMessages.delete(roomId);
+      memoryRooms.delete(roomId);
 
       const nukePayload = {
         type: 'room:nuked',
@@ -1216,12 +1130,12 @@ async function startServer() {
       res.status(200).json({
         ok: true,
         nukedRoomId: roomId,
-        deletedMessages: deletedMessages.rowsAffected || 0,
-        deletedRooms: deletedRooms.rowsAffected || 0,
+        deletedMessages: deletedCount,
+        deletedRooms: 1,
+        hardWiped: true,
         timestamp: Date.now(),
       });
-    } catch (error) {
-      console.error('Error executing nuke:', error);
+    } catch {
       res.status(500).json({
         ok: false,
         error: 'Failed to nuke room records.',
@@ -1229,24 +1143,16 @@ async function startServer() {
     }
   });
 
-  // Trigger manual 24h TTL sweep
-  app.post('/api/maintenance/cleanup', async (_req, res) => {
-    try {
-      const result = await cleanupExpiredData();
-      res.status(200).json({
-        ok: true,
-        ...result,
-        timestamp: Date.now(),
-      });
-    } catch (error) {
-      res.status(500).json({
-        ok: false,
-        error: error instanceof Error ? error.message : 'Failed to run TTL cleanup.',
-      });
-    }
+  // Trigger manual 1h TTL sweep
+  app.post('/api/maintenance/cleanup', (_req, res) => {
+    const result = cleanupExpiredData();
+    res.status(200).json({
+      ok: true,
+      ...result,
+      timestamp: Date.now(),
+    });
   });
 
-  // Catch-all for unknown /api routes to always return valid JSON
   app.all('/api/*', (_req, res) => {
     res.status(404).json({
       ok: false,

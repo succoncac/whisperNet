@@ -1,7 +1,11 @@
-// Cloudflare Worker + Durable Object (Zero-Trace Blind Relay + Real-time WebSockets)
-// WhisperNet Zero-Trace Backend: Collision-Safe Identity Engine (4 -> 5 -> 6 chars), 24h TTL Purge, & Bilateral Nuke
+// Cloudflare Worker + Durable Object (Pure In-Memory Ephemeral RAM + Hard Wipe Protocol + WebRTC P2P Signaling)
+// WhisperNet Zero-Trace Backend:
+// 1. In-Memory Ephemeral RAM Storage Only (Map/Set structures in Durable Object memory, zero disk writes)
+// 2. Hard Wiping Protocol (`await this.ctx.storage.deleteAll()` / `await this.state.storage.deleteAll()`) on 1h TTL & Nuke
+// 3. Hybrid WebRTC P2P Signaling Relay + WebSocket Fallback
+// 4. Collision-Safe Identity Engine (4 -> 5 -> 6 chars), Stale Session Severing (Anti-Ghost Chat), Global CORS
 
-const TTL_MS = 24 * 60 * 60 * 1000;
+const TTL_MS = 60 * 60 * 1000; // 1 Hour Ephemeral TTL in milliseconds
 const GLOBAL_ROOM_ID = 'GLOBAL';
 const ID_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
@@ -60,87 +64,179 @@ function jsonResponse(data, status = 200, request = null, env = null) {
     status,
     headers: {
       'Content-Type': 'application/json',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      'X-Content-Type-Options': 'nosniff',
       ...getCorsHeaders(request, env),
     },
   });
 }
 
 export class WhisperNetHub {
-  constructor(ctx, env) {
-    this.ctx = ctx;
+  constructor(state, env) {
+    this.state = state;
+    this.ctx = state;
     this.env = env;
-    this.sql = ctx.storage.sql;
-    this.clients = new Set();
-    this.initSchema();
+
+    // Pure In-Memory Ephemeral RAM Storage Only (Zero Persistent Disk Storage)
+    this.clients = new Set(); // Set<{ ws, userId, roomId }>
+    this.rooms = new Map(); // Map<roomId, { room_id, created_at }>
+    this.messages = new Map(); // Map<roomId, Array<{ id, room_id, sender_id, content, timestamp }>>
+    this.activeUsers = new Map(); // Map<userId, { user_id, last_seen, public_key }>
+    this.messageReactions = new Map(); // Map<messageId, { roomId, timestamp, reactions: Map<emoji, Set<userId>> }>
+
+    this.ensureGlobalRoomExists();
   }
 
-  initSchema() {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS rooms (
-        room_id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        room_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        content TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS active_users (
-        user_id TEXT PRIMARY KEY,
-        last_seen INTEGER NOT NULL,
-        public_key TEXT
-      );
-      CREATE TABLE IF NOT EXISTS message_reactions (
-        message_id TEXT NOT NULL,
-        room_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        emoji TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        PRIMARY KEY (message_id, user_id, emoji)
-      );
-    `);
-    try {
-      this.sql.exec(`ALTER TABLE active_users ADD COLUMN public_key TEXT`);
-    } catch {
-      // Column already exists
+  ensureGlobalRoomExists() {
+    if (!this.rooms.has(GLOBAL_ROOM_ID)) {
+      this.rooms.set(GLOBAL_ROOM_ID, {
+        room_id: GLOBAL_ROOM_ID,
+        created_at: Date.now(),
+      });
     }
-    const now = Date.now();
-    this.sql.exec(
-      `INSERT OR IGNORE INTO rooms (room_id, created_at) VALUES (?, ?)`,
-      GLOBAL_ROOM_ID,
-      now
-    );
+    if (!this.messages.has(GLOBAL_ROOM_ID)) {
+      this.messages.set(GLOBAL_ROOM_ID, []);
+    }
   }
 
-  cleanupExpiredData() {
-    const cutoff = Date.now() - TTL_MS;
-    this.sql.exec(`DELETE FROM messages WHERE timestamp < ?`, cutoff);
-    this.sql.exec(
-      `DELETE FROM rooms WHERE created_at < ? AND room_id != ?`,
-      cutoff,
-      GLOBAL_ROOM_ID
-    );
-    this.sql.exec(`DELETE FROM active_users WHERE last_seen < ?`, cutoff);
-    this.sql.exec(`DELETE FROM message_reactions WHERE timestamp < ?`, cutoff);
+  // Hard Wiping Protocol (`await state.storage.deleteAll()`) to destroy all references & storage fragments
+  async executeHardStorageWipe() {
+    try {
+      if (this.state && this.state.storage && typeof this.state.storage.deleteAll === 'function') {
+        await this.state.storage.deleteAll();
+      } else if (this.ctx && this.ctx.storage && typeof this.ctx.storage.deleteAll === 'function') {
+        await this.ctx.storage.deleteAll();
+      }
+    } catch {
+      // Ignore if storage engine is already empty
+    }
+  }
+
+  async cleanupExpiredData() {
+    const now = Date.now();
+    const cutoff = now - TTL_MS;
+    let expiredDetected = false;
+    let deletedMessages = 0;
+    let deletedRooms = 0;
+
+    // 1. Purge expired messages from in-memory RAM Map
+    for (const [roomId, msgList] of this.messages.entries()) {
+      const validMsgs = [];
+      for (const msg of msgList) {
+        if (msg.timestamp >= cutoff) {
+          validMsgs.push(msg);
+        } else {
+          expiredDetected = true;
+          deletedMessages++;
+          this.messageReactions.delete(msg.id);
+        }
+      }
+      if (validMsgs.length !== msgList.length) {
+        this.messages.set(roomId, validMsgs);
+      }
+    }
+
+    // 2. Purge expired private rooms from in-memory RAM Map
+    for (const [roomId, roomObj] of this.rooms.entries()) {
+      if (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff) {
+        expiredDetected = true;
+        deletedRooms++;
+        this.rooms.delete(roomId);
+        const roomMsgs = this.messages.get(roomId) || [];
+        for (const m of roomMsgs) {
+          this.messageReactions.delete(m.id);
+        }
+        this.messages.delete(roomId);
+      }
+    }
+
+    // 3. Purge expired user identities (releases ID back into pool after 1-hour TTL)
+    for (const [userId, userObj] of this.activeUsers.entries()) {
+      if (userObj.last_seen < cutoff && !this.isUserCurrentlyOnline(userId)) {
+        expiredDetected = true;
+        this.activeUsers.delete(userId);
+      }
+    }
+
+    // 4. Purge expired reaction entries
+    for (const [msgId, reactEntry] of this.messageReactions.entries()) {
+      if (reactEntry.timestamp < cutoff) {
+        expiredDetected = true;
+        this.messageReactions.delete(msgId);
+      }
+    }
+
+    this.ensureGlobalRoomExists();
+
+    // Execute Hard Wiping Protocol if any 1-hour TTL expiration occurred
+    if (expiredDetected) {
+      await this.executeHardStorageWipe();
+    }
+
+    return { deletedMessages, deletedRooms };
+  }
+
+  isUserCurrentlyOnline(userId) {
+    const clean = normalizeCode(userId);
+    if (!clean) return false;
+    for (const c of this.clients) {
+      if (c.userId === clean) return true;
+    }
+    return false;
   }
 
   isUserIdTaken(candidateId) {
     const clean = normalizeCode(candidateId);
     if (!clean) return false;
-    for (const c of this.clients) {
-      if (c.userId === clean) return true;
-    }
+    if (this.isUserCurrentlyOnline(clean)) return true;
     const cutoff = Date.now() - TTL_MS;
-    const rows = this.sql
-      .exec(
-        `SELECT user_id FROM active_users WHERE user_id = ? AND last_seen >= ? LIMIT 1`,
-        clean,
-        cutoff
-      )
-      .toArray();
-    return rows.length > 0;
+    const record = this.activeUsers.get(clean);
+    return Boolean(record && record.last_seen >= cutoff);
+  }
+
+  severStaleIdentity(staleUserId) {
+    const cleanStale = normalizeCode(staleUserId);
+    if (!cleanStale) return;
+
+    // 1. Sever any open WebSockets still attached to the old/deleted identity
+    for (const c of Array.from(this.clients)) {
+      if (c.userId === cleanStale) {
+        try {
+          c.ws.close(4001, 'Identity superseded or cleared');
+        } catch {
+          // ignore
+        }
+        this.clients.delete(c);
+      }
+    }
+
+    // 2. Delete old identity from in-memory activeUsers map immediately
+    this.activeUsers.delete(cleanStale);
+
+    // 3. Broadcast USER_LEFT / USER_DISCONNECTED to any active 1-on-1 room partners
+    const cutoff = Date.now() - TTL_MS;
+    for (const [roomId, roomObj] of this.rooms.entries()) {
+      if (roomId === GLOBAL_ROOM_ID || roomObj.created_at < cutoff) continue;
+      if (roomId.startsWith(`${cleanStale}__`) || roomId.endsWith(`__${cleanStale}`)) {
+        const peerId = extractPeerFromRoomId(roomId, cleanStale);
+        const payload = {
+          type: 'USER_LEFT',
+          event: 'USER_DISCONNECTED',
+          roomId,
+          userId: cleanStale,
+          peerAlive: false,
+          reason: 'Partner disconnected / left the channel',
+          timestamp: Date.now(),
+        };
+        this.broadcastToRoom(roomId, payload);
+        if (peerId) {
+          this.sendToUser(peerId, payload);
+        }
+      }
+    }
+
+    this.broadcastGlobalPresence();
   }
 
   assignCollisionFreeIdentity(requestedId, isExistingSession = false) {
@@ -172,71 +268,42 @@ export class WhisperNetHub {
     const clean = normalizeCode(userId);
     if (!clean || clean.length < 4) return;
     const now = Date.now();
-    if (publicKey && typeof publicKey === 'string') {
-      this.sql.exec(
-        `INSERT INTO active_users (user_id, last_seen, public_key) VALUES (?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET
-           last_seen = excluded.last_seen,
-           public_key = COALESCE(excluded.public_key, active_users.public_key)`,
-        clean,
-        now,
-        publicKey
-      );
-    } else {
-      this.sql.exec(
-        `INSERT INTO active_users (user_id, last_seen) VALUES (?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen`,
-        clean,
-        now
-      );
-    }
+    const existing = this.activeUsers.get(clean);
+    this.activeUsers.set(clean, {
+      user_id: clean,
+      last_seen: now,
+      public_key: publicKey && typeof publicKey === 'string' ? publicKey : existing?.public_key || null,
+    });
   }
 
   getPeerPublicKey(userId) {
     const clean = normalizeCode(userId);
     if (!clean) return null;
-    const rows = this.sql
-      .exec(`SELECT public_key FROM active_users WHERE user_id = ? LIMIT 1`, clean)
-      .toArray();
-    return rows[0]?.public_key ? String(rows[0].public_key) : null;
-  }
-
-  getReactionsForRoom(roomId, cutoff) {
-    const mapByMessage = {};
-    const rows = this.sql
-      .exec(
-        `SELECT message_id, user_id, emoji FROM message_reactions WHERE room_id = ? AND timestamp >= ?`,
-        roomId,
-        cutoff
-      )
-      .toArray();
-    for (const row of rows) {
-      const msgId = String(row.message_id);
-      const userId = String(row.user_id);
-      const emoji = String(row.emoji);
-      if (!mapByMessage[msgId]) mapByMessage[msgId] = {};
-      if (!mapByMessage[msgId][emoji]) mapByMessage[msgId][emoji] = [];
-      if (!mapByMessage[msgId][emoji].includes(userId)) {
-        mapByMessage[msgId][emoji].push(userId);
-      }
-    }
-    return mapByMessage;
+    const record = this.activeUsers.get(clean);
+    return record?.public_key ? String(record.public_key) : null;
   }
 
   getReactionsForMessage(messageId) {
     const reactionMap = {};
-    const rows = this.sql
-      .exec(`SELECT user_id, emoji FROM message_reactions WHERE message_id = ?`, messageId)
-      .toArray();
-    for (const row of rows) {
-      const userId = String(row.user_id);
-      const emoji = String(row.emoji);
-      if (!reactionMap[emoji]) reactionMap[emoji] = [];
-      if (!reactionMap[emoji].includes(userId)) {
-        reactionMap[emoji].push(userId);
+    const entry = this.messageReactions.get(messageId);
+    if (!entry) return reactionMap;
+    for (const [emoji, userSet] of entry.reactions.entries()) {
+      const arr = Array.from(userSet);
+      if (arr.length > 0) {
+        reactionMap[emoji] = arr;
       }
     }
     return reactionMap;
+  }
+
+  getReactionsForRoom(roomId, cutoff) {
+    const mapByMessage = {};
+    for (const [msgId, entry] of this.messageReactions.entries()) {
+      if (entry.roomId === roomId && entry.timestamp >= cutoff) {
+        mapByMessage[msgId] = this.getReactionsForMessage(msgId);
+      }
+    }
+    return mapByMessage;
   }
 
   broadcastToAll(payload) {
@@ -308,43 +375,13 @@ export class WhisperNetHub {
     });
   }
 
-  doesUserExistOrOnline(targetUserId, requesterId) {
+  doesUserExistOrOnline(targetUserId) {
     const cleanTarget = normalizeCode(targetUserId);
-    const cleanRequester = normalizeCode(requesterId);
     if (!cleanTarget || cleanTarget.length < 4) return false;
-
-    for (const c of this.clients) {
-      if (c.userId === cleanTarget) return true;
-    }
-
+    if (this.isUserCurrentlyOnline(cleanTarget)) return true;
     const cutoff = Date.now() - TTL_MS;
-    const activeRows = this.sql
-      .exec(
-        `SELECT user_id FROM active_users WHERE user_id = ? AND last_seen >= ? LIMIT 1`,
-        cleanTarget,
-        cutoff
-      )
-      .toArray();
-    if (activeRows.length > 0) return true;
-
-    const msgRows = this.sql
-      .exec(
-        `SELECT id FROM messages WHERE sender_id = ? AND timestamp >= ? LIMIT 1`,
-        cleanTarget,
-        cutoff
-      )
-      .toArray();
-    if (msgRows.length > 0) return true;
-
-    const candidateRoomId = buildRoomId(cleanRequester, cleanTarget);
-    const roomRows = this.sql
-      .exec(
-        `SELECT room_id FROM rooms WHERE room_id = ? AND created_at >= ? LIMIT 1`,
-        candidateRoomId,
-        cutoff
-      )
-      .toArray();
-    return roomRows.length > 0;
+    const record = this.activeUsers.get(cleanTarget);
+    return Boolean(record && record.last_seen >= cutoff);
   }
 
   async fetch(request) {
@@ -355,7 +392,7 @@ export class WhisperNetHub {
       return jsonResponse({ ok: true }, 200, request, this.env);
     }
 
-    // WebSocket Upgrade at /ws
+    // WebSocket Upgrade at /ws (Handles Real-Time Chat + WebRTC P2P Signaling Relay)
     if (pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
@@ -367,13 +404,30 @@ export class WhisperNetHub {
       server.addEventListener('message', (event) => {
         try {
           const data = JSON.parse(String(event.data));
-          if (data.type === 'user:identify' && data.userId) {
-            session.userId = normalizeCode(data.userId);
+          if (data.type === 'ping') {
+            if (session.userId) {
+              this.registerIdentity(session.userId);
+            }
+            try {
+              server.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            } catch {
+              // ignore
+            }
+          } else if (data.type === 'user:identify' && data.userId) {
+            const nextUserId = normalizeCode(data.userId);
+            if (session.userId && session.userId !== nextUserId) {
+              this.severStaleIdentity(session.userId);
+            }
+            session.userId = nextUserId;
             this.registerIdentity(session.userId, data.publicKey);
             this.broadcastGlobalPresence();
           } else if (data.type === 'room:join' && data.roomId && data.userId) {
             const prevRoom = session.roomId;
-            session.userId = normalizeCode(data.userId);
+            const nextUserId = normalizeCode(data.userId);
+            if (session.userId && session.userId !== nextUserId) {
+              this.severStaleIdentity(session.userId);
+            }
+            session.userId = nextUserId;
             session.roomId = String(data.roomId);
             this.registerIdentity(session.userId, data.publicKey);
             if (prevRoom && prevRoom !== session.roomId) {
@@ -388,6 +442,19 @@ export class WhisperNetHub {
               userId: session.userId,
               isTyping: Boolean(data.isTyping),
             });
+          } else if (data.type === 'webrtc:signal' && data.targetUserId && session.userId) {
+            // Non-Intrusive Hybrid WebRTC P2P Signaling Relay (SDP Offer/Answer & ICE Candidates)
+            const targetPeer = normalizeCode(data.targetUserId);
+            this.sendToUser(targetPeer, {
+              type: 'webrtc:signal',
+              roomId: String(data.roomId || ''),
+              fromUserId: session.userId,
+              targetUserId: targetPeer,
+              signalType: String(data.signalType || ''),
+              sdp: data.sdp || null,
+              candidate: data.candidate || null,
+              timestamp: Date.now(),
+            });
           }
         } catch {
           // ignore invalid JSON
@@ -396,28 +463,60 @@ export class WhisperNetHub {
 
       server.addEventListener('close', () => {
         this.clients.delete(session);
-        if (session.roomId) {
-          this.broadcastRoomPresence(session.roomId);
+        const closedUserId = session.userId;
+        const closedRoomId = session.roomId;
+
+        if (closedRoomId) {
+          this.broadcastRoomPresence(closedRoomId);
         }
+
+        if (closedUserId && !this.isUserCurrentlyOnline(closedUserId)) {
+          if (closedRoomId && closedRoomId !== GLOBAL_ROOM_ID) {
+            const peerId = extractPeerFromRoomId(closedRoomId, closedUserId);
+            const disconnectPayload = {
+              type: 'USER_DISCONNECTED',
+              event: 'USER_LEFT',
+              roomId: closedRoomId,
+              userId: closedUserId,
+              peerAlive: false,
+              reason: 'Partner disconnected / left the channel',
+              timestamp: Date.now(),
+            };
+            this.broadcastToRoom(closedRoomId, disconnectPayload);
+            if (peerId) {
+              this.sendToUser(peerId, disconnectPayload);
+            }
+          }
+        }
+
         this.broadcastGlobalPresence();
       });
 
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    this.cleanupExpiredData();
+    await this.cleanupExpiredData();
 
-    // POST /api/users/register (Collision Check + Dynamic 4->5->6 Character Scaling)
+    // POST /api/users/register (Collision Check + Dynamic 4->5->6 Character Scaling + Stale Identity Severing)
     if (pathname === '/api/users/register' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
       const requestedId = normalizeCode(body.userId);
+      const previousUserId = normalizeCode(body.previousUserId);
       const isExistingSession = Boolean(body.isExistingSession);
       const publicKey = body.publicKey ? String(body.publicKey) : undefined;
+
+      if (previousUserId && previousUserId !== requestedId) {
+        this.severStaleIdentity(previousUserId);
+      }
 
       const { userId, collisionResolved } = this.assignCollisionFreeIdentity(
         requestedId,
         isExistingSession
       );
+
+      if (requestedId && userId !== requestedId) {
+        this.severStaleIdentity(requestedId);
+      }
 
       this.registerIdentity(userId, publicKey);
       return jsonResponse(
@@ -433,18 +532,24 @@ export class WhisperNetHub {
       );
     }
 
+    // POST /api/users/leave (Sever stale identity immediately)
+    if (pathname === '/api/users/leave' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const userId = normalizeCode(body.userId);
+      if (userId) {
+        this.severStaleIdentity(userId);
+      }
+      return jsonResponse({ ok: true }, 200, request, this.env);
+    }
+
     // GET /api/global/messages
     if (pathname === '/api/global/messages' && request.method === 'GET') {
       const cutoff = Date.now() - TTL_MS;
-      const rows = this.sql
-        .exec(
-          `SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC LIMIT 200`,
-          GLOBAL_ROOM_ID,
-          cutoff
-        )
-        .toArray();
+      const rawMsgs = (this.messages.get(GLOBAL_ROOM_ID) || []).filter(
+        (m) => m.timestamp >= cutoff
+      );
       const reactionsByMsg = this.getReactionsForRoom(GLOBAL_ROOM_ID, cutoff);
-      const messages = rows.map((r) => ({
+      const messages = rawMsgs.slice(-200).map((r) => ({
         id: String(r.id),
         room_id: String(r.room_id),
         sender_id: String(r.sender_id),
@@ -473,15 +578,12 @@ export class WhisperNetHub {
           this.env
         );
       }
+
       this.registerIdentity(senderId);
-      this.sql.exec(
-        `INSERT OR IGNORE INTO messages (id, room_id, sender_id, content, timestamp) VALUES (?, ?, ?, ?, ?)`,
-        messageId,
-        GLOBAL_ROOM_ID,
-        senderId,
-        content,
-        now
-      );
+      this.ensureGlobalRoomExists();
+      const roomList = this.messages.get(GLOBAL_ROOM_ID) || [];
+      const exists = roomList.some((m) => m.id === messageId);
+
       const messageRecord = {
         id: messageId,
         room_id: GLOBAL_ROOM_ID,
@@ -490,11 +592,23 @@ export class WhisperNetHub {
         timestamp: now,
         reactions: {},
       };
-      this.broadcastToAll({
-        type: 'global:message:created',
-        roomId: GLOBAL_ROOM_ID,
-        message: messageRecord,
-      });
+
+      if (!exists) {
+        roomList.push({
+          id: messageId,
+          room_id: GLOBAL_ROOM_ID,
+          sender_id: senderId,
+          content,
+          timestamp: now,
+        });
+        this.messages.set(GLOBAL_ROOM_ID, roomList);
+        this.broadcastToAll({
+          type: 'global:message:created',
+          roomId: GLOBAL_ROOM_ID,
+          message: messageRecord,
+        });
+      }
+
       return jsonResponse({ ok: true, message: messageRecord }, 200, request, this.env);
     }
 
@@ -524,7 +638,7 @@ export class WhisperNetHub {
       }
       this.registerIdentity(myId, myPublicKey);
 
-      if (!this.doesUserExistOrOnline(peerId, myId)) {
+      if (!this.doesUserExistOrOnline(peerId)) {
         return jsonResponse(
           { ok: false, error: 'User not found. Please check the ID and try again.' },
           404,
@@ -537,29 +651,21 @@ export class WhisperNetHub {
       const now = Date.now();
       const cutoff = now - TTL_MS;
 
-      const existing = this.sql
-        .exec(`SELECT room_id, created_at FROM rooms WHERE room_id = ?`, roomId)
-        .toArray();
-      let createdAt = now;
-      const isNewRoom = existing.length === 0;
-      if (isNewRoom) {
-        this.sql.exec(`INSERT INTO rooms (room_id, created_at) VALUES (?, ?)`, roomId, now);
-      } else {
-        createdAt = Number(existing[0].created_at);
+      let roomObj = this.rooms.get(roomId);
+      const isNewRoom = !roomObj;
+      if (!roomObj) {
+        roomObj = { room_id: roomId, created_at: now };
+        this.rooms.set(roomId, roomObj);
+        this.messages.set(roomId, []);
       }
 
-      const rows = this.sql
-        .exec(
-          `SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC`,
-          roomId,
-          cutoff
-        )
-        .toArray();
+      const createdAt = Number(roomObj.created_at);
+      const rawMsgs = (this.messages.get(roomId) || []).filter((m) => m.timestamp >= cutoff);
       const reactionsByMsg = this.getReactionsForRoom(roomId, cutoff);
       const peerPublicKey = this.getPeerPublicKey(peerId);
       const senderPublicKey = this.getPeerPublicKey(myId);
 
-      const messages = rows.map((r) => ({
+      const messages = rawMsgs.map((r) => ({
         id: String(r.id),
         room_id: String(r.room_id),
         sender_id: String(r.sender_id),
@@ -590,6 +696,7 @@ export class WhisperNetHub {
             expires_at: createdAt + TTL_MS,
             peer_id: peerId,
             peer_public_key: peerPublicKey,
+            peer_alive: true,
           },
           messages,
         },
@@ -605,43 +712,24 @@ export class WhisperNetHub {
       const myId = normalizeCode(decodeURIComponent(convMatch[1]));
       this.registerIdentity(myId);
       const cutoff = Date.now() - TTL_MS;
-      const rooms = this.sql
-        .exec(
-          `SELECT room_id, created_at FROM rooms WHERE (room_id LIKE ? OR room_id LIKE ?) AND created_at >= ? ORDER BY created_at DESC`,
-          `${myId}__%`,
-          `%__${myId}`,
-          cutoff
-        )
-        .toArray();
 
       const conversations = [];
-      for (const row of rooms) {
-        const roomId = String(row.room_id);
-        const createdAt = Number(row.created_at);
+      for (const [roomId, roomObj] of this.rooms.entries()) {
+        if (roomId === GLOBAL_ROOM_ID || roomObj.created_at < cutoff) continue;
+        if (!roomId.startsWith(`${myId}__`) && !roomId.endsWith(`__${myId}`)) continue;
+
+        const createdAt = Number(roomObj.created_at);
         const peerId = extractPeerFromRoomId(roomId, myId);
         if (!peerId) continue;
 
-        const lastMsg = this.sql
-          .exec(
-            `SELECT id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 1`,
-            roomId,
-            cutoff
-          )
-          .toArray();
-        const countRes = this.sql
-          .exec(
-            `SELECT COUNT(*) as count FROM messages WHERE room_id = ? AND timestamp >= ?`,
-            roomId,
-            cutoff
-          )
-          .toArray();
-
-        const lastMessage = lastMsg[0]
+        const validMsgs = (this.messages.get(roomId) || []).filter((m) => m.timestamp >= cutoff);
+        const lastRaw = validMsgs.length > 0 ? validMsgs[validMsgs.length - 1] : null;
+        const lastMessage = lastRaw
           ? {
-              id: String(lastMsg[0].id),
-              sender_id: String(lastMsg[0].sender_id),
-              content: String(lastMsg[0].content),
-              timestamp: Number(lastMsg[0].timestamp),
+              id: String(lastRaw.id),
+              sender_id: String(lastRaw.sender_id),
+              content: String(lastRaw.content),
+              timestamp: Number(lastRaw.timestamp),
             }
           : null;
 
@@ -651,11 +739,12 @@ export class WhisperNetHub {
           peer_public_key: this.getPeerPublicKey(peerId),
           created_at: createdAt,
           expires_at: createdAt + TTL_MS,
-          message_count: Number(countRes[0]?.count ?? 0),
+          message_count: validMsgs.length,
           last_message: lastMessage,
           updated_at: lastMessage ? lastMessage.timestamp : createdAt,
         });
       }
+
       conversations.sort((a, b) => b.updated_at - a.updated_at);
       return jsonResponse({ ok: true, conversations }, 200, request, this.env);
     }
@@ -665,10 +754,9 @@ export class WhisperNetHub {
     if (roomMsgsMatch && request.method === 'GET') {
       const roomId = decodeURIComponent(roomMsgsMatch[1]);
       const cutoff = Date.now() - TTL_MS;
-      const roomCheck = this.sql
-        .exec(`SELECT room_id, created_at FROM rooms WHERE room_id = ?`, roomId)
-        .toArray();
-      if (roomCheck.length === 0) {
+      const roomObj = this.rooms.get(roomId);
+
+      if (!roomObj || (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff)) {
         return jsonResponse(
           { ok: true, roomExists: false, messages: [] },
           200,
@@ -676,15 +764,14 @@ export class WhisperNetHub {
           this.env
         );
       }
-      const rows = this.sql
-        .exec(
-          `SELECT id, room_id, sender_id, content, timestamp FROM messages WHERE room_id = ? AND timestamp >= ? ORDER BY timestamp ASC`,
-          roomId,
-          cutoff
-        )
-        .toArray();
+
+      const requesterId = normalizeCode(url.searchParams.get('myId') || '');
+      const peerId = requesterId ? extractPeerFromRoomId(roomId, requesterId) : null;
+      const peerAlive = peerId ? this.doesUserExistOrOnline(peerId) : true;
+
+      const rawMsgs = (this.messages.get(roomId) || []).filter((m) => m.timestamp >= cutoff);
       const reactionsByMsg = this.getReactionsForRoom(roomId, cutoff);
-      const messages = rows.map((r) => ({
+      const messages = rawMsgs.map((r) => ({
         id: String(r.id),
         room_id: String(r.room_id),
         sender_id: String(r.sender_id),
@@ -692,11 +779,13 @@ export class WhisperNetHub {
         timestamp: Number(r.timestamp),
         reactions: reactionsByMsg[String(r.id)] || {},
       }));
+
       return jsonResponse(
         {
           ok: true,
           roomExists: true,
-          createdAt: Number(roomCheck[0].created_at),
+          peerAlive,
+          createdAt: Number(roomObj.created_at),
           messages,
         },
         200,
@@ -724,20 +813,27 @@ export class WhisperNetHub {
           this.env
         );
       }
+
+      const recipientId = extractPeerFromRoomId(roomId, senderId);
+      if (recipientId && !this.doesUserExistOrOnline(recipientId)) {
+        return jsonResponse(
+          {
+            ok: false,
+            peerDisconnected: true,
+            error: 'Partner disconnected / left the channel',
+          },
+          410,
+          request,
+          this.env
+        );
+      }
+
       this.registerIdentity(senderId);
-      this.sql.exec(
-        `INSERT OR IGNORE INTO rooms (room_id, created_at) VALUES (?, ?)`,
-        roomId,
-        now
-      );
-      this.sql.exec(
-        `INSERT OR IGNORE INTO messages (id, room_id, sender_id, content, timestamp) VALUES (?, ?, ?, ?, ?)`,
-        messageId,
-        roomId,
-        senderId,
-        content,
-        now
-      );
+      if (!this.rooms.has(roomId)) {
+        this.rooms.set(roomId, { room_id: roomId, created_at: now });
+      }
+      const roomList = this.messages.get(roomId) || [];
+      const exists = roomList.some((m) => m.id === messageId);
 
       const messageRecord = {
         id: messageId,
@@ -748,23 +844,33 @@ export class WhisperNetHub {
         reactions: {},
       };
 
-      this.broadcastToRoom(roomId, {
-        type: 'message:created',
-        roomId,
-        message: messageRecord,
-      });
+      if (!exists) {
+        roomList.push({
+          id: messageId,
+          room_id: roomId,
+          sender_id: senderId,
+          content,
+          timestamp: now,
+        });
+        this.messages.set(roomId, roomList);
 
-      const recipientId = extractPeerFromRoomId(roomId, senderId);
-      const senderPublicKey = this.getPeerPublicKey(senderId);
-      if (recipientId) {
-        this.sendToUser(recipientId, {
-          type: 'private:message_notification',
+        this.broadcastToRoom(roomId, {
+          type: 'message:created',
           roomId,
-          fromUserId: senderId,
-          fromPublicKey: senderPublicKey,
-          toUserId: recipientId,
           message: messageRecord,
         });
+
+        const senderPublicKey = this.getPeerPublicKey(senderId);
+        if (recipientId) {
+          this.sendToUser(recipientId, {
+            type: 'private:message_notification',
+            roomId,
+            fromUserId: senderId,
+            fromPublicKey: senderPublicKey,
+            toUserId: recipientId,
+            message: messageRecord,
+          });
+        }
       }
 
       return jsonResponse({ ok: true, message: messageRecord }, 200, request, this.env);
@@ -789,32 +895,27 @@ export class WhisperNetHub {
         );
       }
 
-      const existing = this.sql
-        .exec(
-          `SELECT emoji FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ? LIMIT 1`,
-          messageId,
-          userId,
-          emoji
-        )
-        .toArray();
-
       const now = Date.now();
-      if (existing.length > 0 && mode === 'toggle') {
-        this.sql.exec(
-          `DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?`,
-          messageId,
-          userId,
-          emoji
-        );
-      } else if (existing.length === 0) {
-        this.sql.exec(
-          `INSERT INTO message_reactions (message_id, room_id, user_id, emoji, timestamp) VALUES (?, ?, ?, ?, ?)`,
-          messageId,
-          roomId,
-          userId,
-          emoji,
-          now
-        );
+      let entry = this.messageReactions.get(messageId);
+      if (!entry) {
+        entry = { roomId, timestamp: now, reactions: new Map() };
+        this.messageReactions.set(messageId, entry);
+      }
+      entry.timestamp = now;
+
+      let userSet = entry.reactions.get(emoji);
+      if (!userSet) {
+        userSet = new Set();
+        entry.reactions.set(emoji, userSet);
+      }
+
+      if (userSet.has(userId) && mode === 'toggle') {
+        userSet.delete(userId);
+        if (userSet.size === 0) {
+          entry.reactions.delete(emoji);
+        }
+      } else {
+        userSet.add(userId);
       }
 
       const reactions = this.getReactionsForMessage(messageId);
@@ -846,7 +947,7 @@ export class WhisperNetHub {
       );
     }
 
-    // DELETE /api/rooms/:roomId/nuke
+    // DELETE /api/rooms/:roomId/nuke (Hard Wiping Protocol + Immediate RAM Purge)
     const nukeMatch = pathname.match(/^\/api\/rooms\/([^/]+)\/nuke$/);
     if (nukeMatch && request.method === 'DELETE') {
       const roomId = decodeURIComponent(nukeMatch[1]);
@@ -857,9 +958,21 @@ export class WhisperNetHub {
         return jsonResponse({ ok: false, error: 'Invalid room ID.' }, 400, request, this.env);
       }
 
-      this.sql.exec(`DELETE FROM message_reactions WHERE room_id = ?`, roomId);
-      this.sql.exec(`DELETE FROM messages WHERE room_id = ?`, roomId);
-      this.sql.exec(`DELETE FROM rooms WHERE room_id = ?`, roomId);
+      const roomMsgs = this.messages.get(roomId) || [];
+      const deletedCount = roomMsgs.length;
+      for (const m of roomMsgs) {
+        this.messageReactions.delete(m.id);
+      }
+      for (const [msgId, entry] of this.messageReactions.entries()) {
+        if (entry.roomId === roomId) {
+          this.messageReactions.delete(msgId);
+        }
+      }
+      this.messages.delete(roomId);
+      this.rooms.delete(roomId);
+
+      // Execute Hard Wiping Protocol (`await state.storage.deleteAll()`) to purge all storage fragments
+      await this.executeHardStorageWipe();
 
       const nukePayload = {
         type: 'room:nuked',
@@ -879,8 +992,9 @@ export class WhisperNetHub {
         {
           ok: true,
           nukedRoomId: roomId,
-          deletedMessages: 1,
+          deletedMessages: deletedCount,
           deletedRoom: 1,
+          hardWiped: true,
           timestamp: Date.now(),
         },
         200,

@@ -21,6 +21,7 @@ import {
   Smile,
   Volume2,
   VolumeX,
+  EyeOff,
 } from 'lucide-react';
 import {
   getOrCreateMyEcdhIdentity,
@@ -47,6 +48,7 @@ interface RoomMetadata {
   expires_at: number;
   peer_id: string;
   peer_public_key?: string | null;
+  peer_alive?: boolean;
 }
 
 interface PrivateConversationSummary {
@@ -72,6 +74,7 @@ interface IncomingNotificationToast {
   headline: string;
   preview: string;
   timestamp: number;
+  exiting?: boolean;
 }
 
 interface EmojiCategory {
@@ -81,10 +84,20 @@ interface EmojiCategory {
   emojis: string[];
 }
 
-const TTL_MS = 24 * 60 * 60 * 1000;
+// 1-Hour Ephemeral TTL for all messages, rooms, and user identities
+const TTL_MS = 60 * 60 * 1000;
+// Prolonged Inactivity Idle Timeout (15 minutes) triggers automatic local wipe & disconnect
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+
 const SESSION_IDENTITY_KEY = 'whispernet_immutable_session_id_v1';
 const SESSION_IDENTITY_META_KEY = 'whispernet_identity_meta_v1';
 const SOUND_ENABLED_KEY = 'whispernet_sound_enabled_v1';
+
+// Public STUN servers for non-intrusive WebRTC P2P data channel negotiation
+const RTC_ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:stun.l.google.com:19302' },
+];
 
 interface StoredSessionIdentity {
   id: string;
@@ -267,6 +280,7 @@ export default function App() {
   const [myId, setMyId] = useState<string>(initialIdentity.id);
   const [myIdExpiresAt, setMyIdExpiresAt] = useState<number>(initialIdentity.expiresAt);
   const isExistingSessionRef = useRef<boolean>(initialIdentity.isExisting);
+  const previousUserIdRef = useRef<string | null>(null);
 
   // Navigation Tabs: 'global' (Global Chat) | 'private' (Private Chats)
   const [activeTab, setActiveTab] = useState<'global' | 'private'>('global');
@@ -287,6 +301,12 @@ export default function App() {
   const [conversations, setConversations] = useState<PrivateConversationSummary[]>([]);
   const [unreadByPeer, setUnreadByPeer] = useState<Record<string, number>>({});
   const [toastQueue, setToastQueue] = useState<IncomingNotificationToast[]>([]);
+
+  // Stale Session / Disconnected Partner State ("Ghost Chat" Prevention)
+  const [peerDisconnected, setPeerDisconnected] = useState<boolean>(false);
+
+  // Privacy Screen Blur (Page Visibility API / Window Focus Guard)
+  const [isPrivacyBlurred, setIsPrivacyBlurred] = useState<boolean>(false);
 
   // Web Audio API Sound Notification State
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
@@ -325,6 +345,10 @@ export default function App() {
   const [nowTick, setNowTick] = useState<number>(Date.now());
 
   const wsRef = useRef<WebSocket | null>(null);
+  const rtcPeerRef = useRef<RTCPeerConnection | null>(null);
+  const rtcChannelRef = useRef<RTCDataChannel | null>(null);
+  const lastActivityRef = useRef<number>(Date.now());
+
   const audioCtxRef = useRef<AudioContext | null>(null);
   const soundEnabledRef = useRef<boolean>(soundEnabled);
   const initialConvsSyncedRef = useRef<boolean>(false);
@@ -345,7 +369,7 @@ export default function App() {
   activePeerIdRef.current = activePeerId;
   soundEnabledRef.current = soundEnabled;
 
-  // Lightweight Web Audio API Synthesizer for Subtle Notification Ping
+  // Lightweight Web Audio API Synthesizer for Instant Zero-Latency Notification Ping
   const playNotificationPing = useCallback((variant: 'message' | 'request' = 'message') => {
     if (!soundEnabledRef.current) return;
     try {
@@ -411,6 +435,69 @@ export default function App() {
     return () => window.removeEventListener('pointerdown', unlockAudio);
   }, []);
 
+  // Privacy Screen (Page Visibility API & Window Blur Protection) + Idle Activity Tracker
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        setIsPrivacyBlurred(true);
+      } else {
+        setIsPrivacyBlurred(false);
+        lastActivityRef.current = Date.now();
+      }
+    };
+
+    const handleWindowBlur = () => {
+      setIsPrivacyBlurred(true);
+    };
+
+    const handleWindowFocus = () => {
+      setIsPrivacyBlurred(false);
+      lastActivityRef.current = Date.now();
+    };
+
+    const recordActivity = () => {
+      lastActivityRef.current = Date.now();
+      if (document.visibilityState === 'visible') {
+        setIsPrivacyBlurred(false);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('pointerdown', recordActivity, { passive: true });
+    window.addEventListener('keydown', recordActivity, { passive: true });
+    window.addEventListener('touchstart', recordActivity, { passive: true });
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('blur', handleWindowBlur);
+      window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('pointerdown', recordActivity);
+      window.removeEventListener('keydown', recordActivity);
+      window.removeEventListener('touchstart', recordActivity);
+    };
+  }, []);
+
+  const closeWebRtcChannel = useCallback(() => {
+    if (rtcChannelRef.current) {
+      try {
+        rtcChannelRef.current.close();
+      } catch {
+        // ignore
+      }
+      rtcChannelRef.current = null;
+    }
+    if (rtcPeerRef.current) {
+      try {
+        rtcPeerRef.current.close();
+      } catch {
+        // ignore
+      }
+      rtcPeerRef.current = null;
+    }
+  }, []);
+
   const toggleSoundEnabled = () => {
     setSoundEnabled((prev) => {
       const next = !prev;
@@ -427,6 +514,16 @@ export default function App() {
     });
   };
 
+  const dismissToast = useCallback((toastId: string) => {
+    setToastQueue((prev) =>
+      prev.map((item) => (item.id === toastId ? { ...item, exiting: true } : item))
+    );
+    window.setTimeout(() => {
+      setToastQueue((prev) => prev.filter((item) => item.id !== toastId));
+    }, 260);
+  }, []);
+
+  // 5-Second Toast Lifecycle: Smooth fade out & full DOM removal after exactly 5000ms
   const pushNotificationToast = useCallback(
     (fromUserId: string, roomId: string, headline: string, preview: string) => {
       const toastId = `TOAST-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
@@ -438,16 +535,124 @@ export default function App() {
         headline,
         preview,
         timestamp: Date.now(),
+        exiting: false,
       };
       setToastQueue((prev) =>
         [newToast, ...prev.filter((t) => t.fromUserId !== fromUserId)].slice(0, 2)
       );
 
       window.setTimeout(() => {
+        setToastQueue((prev) =>
+          prev.map((t) => (t.id === toastId ? { ...t, exiting: true } : t))
+        );
+      }, 4740);
+
+      window.setTimeout(() => {
         setToastQueue((prev) => prev.filter((t) => t.id !== toastId));
-      }, 9000);
+      }, 5000);
     },
     []
+  );
+
+  // Attach P2P DataChannel listeners for zero-server-latency direct message & typing frames
+  const bindRtcDataChannel = useCallback(
+    (channel: RTCDataChannel, roomId: string, peerId: string) => {
+      rtcChannelRef.current = channel;
+
+      channel.onmessage = async (event) => {
+        try {
+          const packet = JSON.parse(String(event.data));
+          if (packet.type === 'p2p:typing' && packet.roomId === activeRoomIdRef.current) {
+            setPeerTyping(Boolean(packet.isTyping));
+          } else if (
+            packet.type === 'p2p:message' &&
+            packet.message &&
+            packet.roomId === activeRoomIdRef.current
+          ) {
+            const rawMsg: ChatMessage = packet.message;
+            seenMessageIdsRef.current.add(rawMsg.id);
+            const plainText = await decryptMessageContent(rawMsg.content, roomId, peerId);
+            const incoming: ChatMessage = { ...rawMsg, content: plainText };
+
+            setPrivateMessages((prev) => {
+              if (prev.some((m) => m.id === incoming.id)) return prev;
+              return [...prev, incoming];
+            });
+            setPeerTyping(false);
+            setPeerOnline(true);
+            setPeerDisconnected(false);
+            playNotificationPing('message');
+          }
+        } catch {
+          // Ignore malformed P2P frame
+        }
+      };
+
+      channel.onclose = () => {
+        if (rtcChannelRef.current === channel) {
+          rtcChannelRef.current = null;
+        }
+      };
+    },
+    [playNotificationPing]
+  );
+
+  // Non-Intrusive Hybrid WebRTC P2P Setup with Automatic Fallback to Cloudflare WebSocket Relay
+  const initiateBackgroundWebRtcP2P = useCallback(
+    async (roomId: string, peerId: string, isInitiator: boolean) => {
+      if (typeof window === 'undefined' || !('RTCPeerConnection' in window)) return;
+      closeWebRtcChannel();
+
+      try {
+        const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+        rtcPeerRef.current = pc;
+
+        pc.onicecandidate = (event) => {
+          if (
+            event.candidate &&
+            wsRef.current &&
+            wsRef.current.readyState === WebSocket.OPEN
+          ) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: 'webrtc:signal',
+                roomId,
+                targetUserId: peerId,
+                signalType: 'ice-candidate',
+                candidate: event.candidate,
+              })
+            );
+          }
+        };
+
+        pc.ondatachannel = (event) => {
+          bindRtcDataChannel(event.channel, roomId, peerId);
+        };
+
+        if (isInitiator) {
+          const dc = pc.createDataChannel('whispernet-zero-trace-p2p', { ordered: true });
+          bindRtcDataChannel(dc, roomId, peerId);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: 'webrtc:signal',
+                roomId,
+                targetUserId: peerId,
+                signalType: 'offer',
+                sdp: pc.localDescription,
+              })
+            );
+          }
+        }
+      } catch {
+        // Graceful fallback: WebSocket relay continues uninterrupted if WebRTC fails
+        closeWebRtcChannel();
+      }
+    },
+    [bindRtcDataChannel, closeWebRtcChannel]
   );
 
   // Initialize Client-Side KeyPair & Register Identity with Backend Collision Check (4 -> 5 -> 6 chars)
@@ -462,11 +667,13 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             userId: myId,
+            previousUserId: previousUserIdRef.current || undefined,
             isExistingSession: isExistingSessionRef.current,
             publicKey: publicKeyJwkString,
           }),
         });
         const data = await res.json();
+        previousUserIdRef.current = null;
         if (active && data?.ok && data.userId && data.userId !== myId) {
           const now = Date.now();
           const newExpiresAt = now + TTL_MS;
@@ -581,12 +788,59 @@ export default function App() {
     fetchConversations();
   }, [fetchGlobalMessages, fetchConversations]);
 
-  // 1-second ticker for TTL Countdown & 24-Hour User Identity Expiration
+  // 1-second ticker for 1-Hour TTL Countdown, Storage Watchdog, & Idle Auto-Wipe
   useEffect(() => {
     const timer = window.setInterval(() => {
       const now = Date.now();
       setNowTick(now);
-      if (now >= myIdExpiresAt) {
+
+      // Check for prolonged user inactivity (Idle Auto-Wipe after 15m)
+      const isIdleExpired = now - lastActivityRef.current >= IDLE_TIMEOUT_MS;
+
+      // Detect if user cleared cookies / localStorage / sessionStorage or if 1-hour TTL expired
+      let storageCleared = false;
+      try {
+        const storedId =
+          localStorage.getItem(SESSION_IDENTITY_KEY) ||
+          sessionStorage.getItem(SESSION_IDENTITY_KEY);
+        if (!storedId || storedId !== myId) {
+          storageCleared = true;
+        }
+      } catch {
+        // ignore
+      }
+
+      if (now >= myIdExpiresAt || storageCleared || isIdleExpired) {
+        const oldId = myId;
+        previousUserIdRef.current = oldId;
+        lastActivityRef.current = now;
+
+        // Clear local/session storage before rotating identity on idle timeout
+        if (isIdleExpired) {
+          try {
+            localStorage.clear();
+            sessionStorage.clear();
+          } catch {
+            // ignore
+          }
+        }
+
+        // Sever the old identity socket and notify peers immediately
+        fetch('/api/users/leave', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: oldId }),
+        }).catch(() => {});
+
+        closeWebRtcChannel();
+        if (wsRef.current) {
+          try {
+            wsRef.current.close();
+          } catch {
+            // ignore
+          }
+        }
+
         resetMyEcdhIdentity();
         const rotated = generateFreshClientSideIdentity();
         isExistingSessionRef.current = false;
@@ -594,39 +848,48 @@ export default function App() {
         setMyIdExpiresAt(rotated.expiresAt);
         setActiveRoom(null);
         setActivePeerId(null);
+        setPeerDisconnected(false);
         setPrivateMessages([]);
         setConversations([]);
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [myIdExpiresAt]);
+  }, [myId, myIdExpiresAt, closeWebRtcChannel]);
 
-  // Auto-scroll Global Chat
+  // Auto-scroll Global Chat only on new message arrival or tab switch
+  const prevGlobalLenRef = useRef<number>(0);
   useEffect(() => {
     if (activeTab === 'global') {
-      globalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      if (globalMessages.length !== prevGlobalLenRef.current) {
+        globalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }
+      prevGlobalLenRef.current = globalMessages.length;
     }
-  }, [globalMessages, activeTab]);
+  }, [globalMessages.length, activeTab]);
 
-  // Auto-scroll Private Chat
+  // Auto-scroll Private Chat only on new message arrival, typing, or disconnect state change
+  const prevPrivateLenRef = useRef<number>(0);
   useEffect(() => {
     if (activeTab === 'private') {
-      privateEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      if (privateMessages.length !== prevPrivateLenRef.current || peerTyping || peerDisconnected) {
+        privateEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }
+      prevPrivateLenRef.current = privateMessages.length;
     }
-  }, [privateMessages, peerTyping, activeTab]);
+  }, [privateMessages.length, peerTyping, peerDisconnected, activeTab]);
 
   // Emoji Insertion Helper for Both Global and Private Chat
   const handleInsertEmoji = (emoji: string) => {
     if (pickerOpenFor === 'global') {
       setGlobalDraft((prev) => `${prev}${emoji}`);
       globalInputRef.current?.focus();
-    } else if (pickerOpenFor === 'private') {
+    } else if (pickerOpenFor === 'private' && !peerDisconnected) {
       setPrivateDraft((prev) => `${prev}${emoji}`);
       privateInputRef.current?.focus();
     }
   };
 
-  // Connect to 1-on-1 Private Chat with Strict User Existence Validation & Public Key Exchange
+  // Connect to 1-on-1 Private Chat with Strict User Existence Validation, Key Exchange & Background WebRTC P2P
   const connectToPeerChannel = useCallback(
     async (targetPeerRaw: string, notifyPeer = true) => {
       const targetPeer = normalizeUserCode(targetPeerRaw);
@@ -678,6 +941,7 @@ export default function App() {
 
         setActivePeerId(targetPeer);
         setActiveRoom(data.room);
+        setPeerDisconnected(data.room?.peer_alive === false);
         setPrivateMessages(decryptedMessages);
         setActiveTab('private');
         setPeerInput(targetPeer);
@@ -704,6 +968,11 @@ export default function App() {
           );
         }
 
+        // Attempt non-intrusive background WebRTC P2P data channel (graceful fallback to WS relay)
+        if (data.room?.peer_alive !== false) {
+          initiateBackgroundWebRtcP2P(data.room.room_id, targetPeer, true).catch(() => {});
+        }
+
         fetchConversations();
       } catch {
         setErrorBanner('User not found. Please check the ID and try again.');
@@ -711,13 +980,22 @@ export default function App() {
         setIsConnecting(false);
       }
     },
-    [myId, fetchConversations]
+    [myId, fetchConversations, initiateBackgroundWebRtcP2P]
   );
 
-  // Persistent WebSocket Connection for Real-Time Chat, Reactions & Notifications
+  // Persistent WebSocket Connection with 30s Keep-Alive Ping-Pong, Exponential Backoff & WebRTC Signaling
   useEffect(() => {
     let isMounted = true;
     let reconnectTimer: number | null = null;
+    let pingInterval: number | null = null;
+    let retryAttempt = 0;
+
+    function clearHeartbeat() {
+      if (pingInterval) {
+        window.clearInterval(pingInterval);
+        pingInterval = null;
+      }
+    }
 
     function connectWebSocket() {
       if (!isMounted) return;
@@ -728,6 +1006,7 @@ export default function App() {
 
       ws.onopen = async () => {
         if (!isMounted) return;
+        retryAttempt = 0;
         const { publicKeyJwkString } = await getOrCreateMyEcdhIdentity();
         ws.send(
           JSON.stringify({
@@ -746,16 +1025,30 @@ export default function App() {
             })
           );
         }
+
+        clearHeartbeat();
+        // Send periodic 30-second keep-alive ping packets to prevent Cloudflare Worker WebSocket timeouts
+        pingInterval = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping', userId: myId, timestamp: Date.now() }));
+          }
+        }, 30000);
       };
 
       ws.onmessage = async (event) => {
         if (!isMounted) return;
         try {
           const payload = JSON.parse(event.data);
+          if (payload.type === 'pong') return;
 
           // 1. Global Presence Update
           if (payload.type === 'global:presence' && Array.isArray(payload.users)) {
-            setOnlineUsers(payload.users);
+            const currentOnline: string[] = payload.users;
+            setOnlineUsers(currentOnline);
+            if (activePeerIdRef.current && currentOnline.includes(activePeerIdRef.current)) {
+              setPeerOnline(true);
+              setPeerDisconnected(false);
+            }
           }
 
           // 2. Global Public Message Created
@@ -795,7 +1088,99 @@ export default function App() {
             }
           }
 
-          // 4. Incoming Private Chat Request Notification
+          // 4. Stale Session / Partner Disconnected or Left Event ("Ghost Chat" Fix)
+          else if (
+            (payload.type === 'USER_DISCONNECTED' || payload.type === 'USER_LEFT') &&
+            payload.userId
+          ) {
+            const departedUser = String(payload.userId);
+            if (
+              departedUser === activePeerIdRef.current ||
+              (payload.roomId && payload.roomId === activeRoomIdRef.current)
+            ) {
+              closeWebRtcChannel();
+              setPeerOnline(false);
+              setPeerTyping(false);
+              setPeerDisconnected(true);
+              setPickerOpenFor(null);
+            }
+            fetchConversations();
+          }
+
+          // 5. Hybrid WebRTC P2P Signaling Relay (Offer / Answer / ICE Candidate)
+          else if (payload.type === 'webrtc:signal' && payload.fromUserId) {
+            const fromPeer = String(payload.fromUserId);
+            const signalRoomId = String(payload.roomId || '');
+            if (
+              activeRoomIdRef.current &&
+              signalRoomId === activeRoomIdRef.current &&
+              fromPeer === activePeerIdRef.current &&
+              typeof window !== 'undefined' &&
+              'RTCPeerConnection' in window
+            ) {
+              try {
+                if (payload.signalType === 'offer' && payload.sdp) {
+                  closeWebRtcChannel();
+                  const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+                  rtcPeerRef.current = pc;
+
+                  pc.onicecandidate = (iceEvent) => {
+                    if (iceEvent.candidate && ws.readyState === WebSocket.OPEN) {
+                      ws.send(
+                        JSON.stringify({
+                          type: 'webrtc:signal',
+                          roomId: signalRoomId,
+                          targetUserId: fromPeer,
+                          signalType: 'ice-candidate',
+                          candidate: iceEvent.candidate,
+                        })
+                      );
+                    }
+                  };
+
+                  pc.ondatachannel = (dcEvent) => {
+                    bindRtcDataChannel(dcEvent.channel, signalRoomId, fromPeer);
+                  };
+
+                  await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+                  const answer = await pc.createAnswer();
+                  await pc.setLocalDescription(answer);
+
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'webrtc:signal',
+                        roomId: signalRoomId,
+                        targetUserId: fromPeer,
+                        signalType: 'answer',
+                        sdp: pc.localDescription,
+                      })
+                    );
+                  }
+                } else if (
+                  payload.signalType === 'answer' &&
+                  payload.sdp &&
+                  rtcPeerRef.current
+                ) {
+                  await rtcPeerRef.current.setRemoteDescription(
+                    new RTCSessionDescription(payload.sdp)
+                  );
+                } else if (
+                  payload.signalType === 'ice-candidate' &&
+                  payload.candidate &&
+                  rtcPeerRef.current
+                ) {
+                  await rtcPeerRef.current.addIceCandidate(
+                    new RTCIceCandidate(payload.candidate)
+                  );
+                }
+              } catch {
+                // Ignore WebRTC signaling error; WebSocket fallback remains active
+              }
+            }
+          }
+
+          // 6. Incoming Private Chat Request Notification
           else if (payload.type === 'private:chat_request' && payload.fromUserId) {
             const senderId = String(payload.fromUserId);
             if (payload.fromPublicKey) {
@@ -807,7 +1192,10 @@ export default function App() {
             const isAlreadyViewingThisPeer =
               activeTabRef.current === 'private' && activePeerIdRef.current === senderId;
 
-            if (!isAlreadyViewingThisPeer) {
+            if (isAlreadyViewingThisPeer) {
+              setPeerOnline(true);
+              setPeerDisconnected(false);
+            } else {
               setUnreadByPeer((prev) => ({
                 ...prev,
                 [senderId]: (prev[senderId] || 0) + 1,
@@ -822,7 +1210,7 @@ export default function App() {
             }
           }
 
-          // 5. Incoming Direct Private Message Notification
+          // 7. Incoming Direct Private Message Notification
           else if (
             payload.type === 'private:message_notification' &&
             payload.message &&
@@ -849,6 +1237,8 @@ export default function App() {
             fetchConversations();
 
             if (activeRoomIdRef.current === roomId) {
+              setPeerOnline(true);
+              setPeerDisconnected(false);
               setPrivateMessages((prev) => {
                 if (prev.some((m) => m.id === incomingMsg.id)) return prev;
                 return [...prev, incomingMsg];
@@ -875,7 +1265,7 @@ export default function App() {
             }
           }
 
-          // 6. Active Private Room Presence
+          // 8. Active Private Room Presence
           else if (
             payload.type === 'room:presence' &&
             payload.roomId === activeRoomIdRef.current
@@ -883,9 +1273,12 @@ export default function App() {
             const participants: string[] = payload.participants || [];
             const otherOnline = participants.some((u) => u !== myId);
             setPeerOnline(otherOnline);
+            if (otherOnline) {
+              setPeerDisconnected(false);
+            }
           }
 
-          // 7. Active Private Room Message Broadcast
+          // 9. Active Private Room Message Broadcast
           else if (
             payload.type === 'message:created' &&
             payload.roomId === activeRoomIdRef.current &&
@@ -907,10 +1300,12 @@ export default function App() {
             });
             if (incoming.sender_id !== myId) {
               setPeerTyping(false);
+              setPeerOnline(true);
+              setPeerDisconnected(false);
             }
           }
 
-          // 8. Typing Indicator
+          // 10. Typing Indicator
           else if (
             payload.type === 'room:typing' &&
             payload.roomId === activeRoomIdRef.current &&
@@ -919,15 +1314,17 @@ export default function App() {
             setPeerTyping(Boolean(payload.isTyping));
           }
 
-          // 9. Instant Room Nuke Event
+          // 11. Instant Room Nuke Event
           else if (payload.type === 'room:nuked' && payload.roomId) {
             const nukedId = String(payload.roomId);
             fetchConversations();
 
             if (nukedId === activeRoomIdRef.current) {
+              closeWebRtcChannel();
               setPrivateMessages([]);
               setActiveRoom(null);
               setActivePeerId(null);
+              setPeerDisconnected(false);
               setShowNukeModal(false);
               setNukeAlert(
                 `NUKE EXECUTED: Room ${nukedId} and all messages were permanently wiped by ${payload.triggeredBy || 'peer'}.`
@@ -940,9 +1337,14 @@ export default function App() {
       };
 
       ws.onclose = () => {
+        clearHeartbeat();
         if (!isMounted) return;
         setPeerOnline(false);
-        reconnectTimer = window.setTimeout(connectWebSocket, 2500);
+        // Exponential backoff delay (1s -> 2s -> 4s -> 8s -> max 15s) with jitter for mobile network resilience
+        const baseDelay = Math.min(15000, 1000 * Math.pow(2, retryAttempt));
+        const jitter = Math.floor(Math.random() * 400);
+        retryAttempt += 1;
+        reconnectTimer = window.setTimeout(connectWebSocket, baseDelay + jitter);
       };
     }
 
@@ -950,12 +1352,21 @@ export default function App() {
 
     return () => {
       isMounted = false;
+      clearHeartbeat();
+      closeWebRtcChannel();
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (wsRef.current) {
         wsRef.current.close();
       }
     };
-  }, [myId, fetchConversations, pushNotificationToast, playNotificationPing]);
+  }, [
+    myId,
+    fetchConversations,
+    pushNotificationToast,
+    playNotificationPing,
+    bindRtcDataChannel,
+    closeWebRtcChannel,
+  ]);
 
   // Fallback Polling for Global, Conversations & Private Chat (every 3.5s)
   useEffect(() => {
@@ -966,20 +1377,29 @@ export default function App() {
       if (activeRoom?.room_id) {
         try {
           const res = await fetch(
-            `/api/rooms/${encodeURIComponent(activeRoom.room_id)}/messages`
+            `/api/rooms/${encodeURIComponent(activeRoom.room_id)}/messages?myId=${encodeURIComponent(myId)}`
           );
           const data = await res.json();
           if (!data.ok) return;
 
           if (data.roomExists === false) {
+            closeWebRtcChannel();
             setPrivateMessages([]);
             setActiveRoom(null);
             setActivePeerId(null);
+            setPeerDisconnected(false);
             setNukeAlert(
               'CHANNEL TERMINATED: Private room and all messages were permanently purged.'
             );
             fetchConversations();
             return;
+          }
+
+          if (data.peerAlive === false) {
+            closeWebRtcChannel();
+            setPeerOnline(false);
+            setPeerTyping(false);
+            setPeerDisconnected(true);
           }
 
           if (Array.isArray(data.messages)) {
@@ -997,7 +1417,7 @@ export default function App() {
     }, 3500);
 
     return () => window.clearInterval(pollInterval);
-  }, [activeRoom?.room_id, fetchGlobalMessages, fetchConversations]);
+  }, [activeRoom?.room_id, myId, fetchGlobalMessages, fetchConversations, closeWebRtcChannel]);
 
   const handleManualSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1149,19 +1569,20 @@ export default function App() {
     await sendGlobalContent(text);
   };
 
-  // Transmit Private 1-on-1 Content (Encrypted Under the Hood)
+  // Transmit Private 1-on-1 Content (Hybrid WebRTC P2P Fast-Path + Reliable WebSocket/REST Fallback)
   const sendPrivateContent = async (rawContent: string) => {
-    if (!activeRoom || isSendingPrivate) return;
+    if (!activeRoom || isSendingPrivate || peerDisconnected) return;
     const text = rawContent.trim();
     if (!text) return;
 
-    const tempId = `MSG-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const now = Date.now();
+    const tempId = `MSG-${now}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
     const optimisticMsg: ChatMessage = {
       id: tempId,
       room_id: activeRoom.room_id,
       sender_id: myId,
       content: text,
-      timestamp: Date.now(),
+      timestamp: now,
       reactions: {},
     };
 
@@ -1187,6 +1608,29 @@ export default function App() {
         activePeerId || undefined
       );
 
+      // 1. If WebRTC P2P DataChannel is open, transmit encrypted frame directly peer-to-peer for sub-10ms delivery
+      if (rtcChannelRef.current && rtcChannelRef.current.readyState === 'open') {
+        try {
+          rtcChannelRef.current.send(
+            JSON.stringify({
+              type: 'p2p:message',
+              roomId: activeRoom.room_id,
+              message: {
+                id: tempId,
+                room_id: activeRoom.room_id,
+                sender_id: myId,
+                content: encryptedCiphertext,
+                timestamp: now,
+                reactions: {},
+              },
+            })
+          );
+        } catch {
+          // Fallback to WebSocket/HTTP relay seamlessly
+        }
+      }
+
+      // 2. Always sync ciphertext to ephemeral in-memory Durable Object relay for reliable fallback & reaction state
       const res = await fetch(`/api/rooms/${encodeURIComponent(activeRoom.room_id)}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1199,7 +1643,14 @@ export default function App() {
       const data = await res.json();
       if (!res.ok || !data.ok) {
         setPrivateMessages((prev) => prev.filter((m) => m.id !== tempId));
-        setErrorBanner(data.error || 'Failed to send private message.');
+        if (res.status === 410 || data.peerDisconnected) {
+          closeWebRtcChannel();
+          setPeerOnline(false);
+          setPeerTyping(false);
+          setPeerDisconnected(true);
+        } else {
+          setErrorBanner(data.error || 'Failed to send private message.');
+        }
       } else {
         fetchConversations();
       }
@@ -1213,7 +1664,7 @@ export default function App() {
 
   const handleSendPrivateMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!privateDraft.trim()) return;
+    if (!privateDraft.trim() || peerDisconnected) return;
     const text = privateDraft;
     setPrivateDraft('');
     setPickerOpenFor(null);
@@ -1221,22 +1672,57 @@ export default function App() {
   };
 
   const handlePrivateDraftChange = (val: string) => {
+    if (peerDisconnected) return;
     setPrivateDraft(val);
-    if (!activeRoom || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (!activeRoom) return;
 
-    wsRef.current.send(
-      JSON.stringify({
-        type: 'room:typing',
-        roomId: activeRoom.room_id,
-        userId: myId,
-        isTyping: val.trim().length > 0,
-      })
-    );
+    const isTypingNow = val.trim().length > 0;
+
+    // Fast-path typing indicator over WebRTC P2P DataChannel if open
+    if (rtcChannelRef.current && rtcChannelRef.current.readyState === 'open') {
+      try {
+        rtcChannelRef.current.send(
+          JSON.stringify({
+            type: 'p2p:typing',
+            roomId: activeRoom.room_id,
+            userId: myId,
+            isTyping: isTypingNow,
+          })
+        );
+      } catch {
+        // ignore
+      }
+    }
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'room:typing',
+          roomId: activeRoom.room_id,
+          userId: myId,
+          isTyping: isTypingNow,
+        })
+      );
+    }
 
     if (typingTimeoutRef.current) {
       window.clearTimeout(typingTimeoutRef.current);
     }
     typingTimeoutRef.current = window.setTimeout(() => {
+      if (rtcChannelRef.current && rtcChannelRef.current.readyState === 'open' && activeRoom) {
+        try {
+          rtcChannelRef.current.send(
+            JSON.stringify({
+              type: 'p2p:typing',
+              roomId: activeRoom.room_id,
+              userId: myId,
+              isTyping: false,
+            })
+          );
+        } catch {
+          // ignore
+        }
+      }
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && activeRoom) {
         wsRef.current.send(
           JSON.stringify({
@@ -1250,7 +1736,7 @@ export default function App() {
     }, 2000);
   };
 
-  // Execute "Nuke Chat"
+  // Execute "Nuke Chat" (Triggers Bilateral In-Memory + Storage deleteAll() Hard Wipe)
   const handleConfirmNuke = async () => {
     if (!activeRoom || isNuking) return;
     setIsNuking(true);
@@ -1278,9 +1764,11 @@ export default function App() {
         });
       }
 
+      closeWebRtcChannel();
       setPrivateMessages([]);
       setActiveRoom(null);
       setActivePeerId(null);
+      setPeerDisconnected(false);
       setShowNukeModal(false);
       setNukeAlert(
         `NUKE COMPLETE: Permanently wiped ${data.deletedMessages} messages and room history (${data.nukedRoomId}) for both participants.`
@@ -1339,7 +1827,7 @@ export default function App() {
           isMine ? 'items-end' : 'items-start'
         }`}
       >
-        {/* Metadata Row: Sender ID + TTL Countdown ONLY (No HH:MM:SS Send Timestamps) */}
+        {/* Metadata Row: Sender ID + 1h TTL Countdown ONLY (No HH:MM:SS Send Timestamps) */}
         <div className="flex flex-wrap items-center gap-1.5 mb-1 px-1 text-[10px] sm:text-[11px] text-zinc-400 font-mono tabular-nums max-w-full select-none">
           {isMine ? (
             <span className="text-emerald-400 font-semibold">{myId} (You)</span>
@@ -1347,77 +1835,57 @@ export default function App() {
             <button
               type="button"
               onClick={() => connectToPeerChannel(msg.sender_id, true)}
-              className="text-emerald-400 hover:text-emerald-300 font-semibold underline decoration-emerald-500/50 underline-offset-2 cursor-pointer flex items-center gap-1 select-none"
-              title={`Open 1-on-1 private chat with ${msg.sender_id}`}
+              className="text-amber-400 hover:text-amber-300 font-semibold underline decoration-amber-500/40 underline-offset-2 cursor-pointer transition-colors"
+              title={`Click to start a 1-on-1 private chat with ${msg.sender_id}`}
             >
-              <span>{msg.sender_id}</span>
-              <span className="text-[10px] text-zinc-400 no-underline">
-                [Chat 1-on-1 →]
-              </span>
+              {msg.sender_id} ↗
             </button>
           ) : (
             <span className="text-zinc-300 font-semibold">{msg.sender_id}</span>
           )}
-          <span>·</span>
-          <span className="text-zinc-500" title="Time remaining before 24-hour auto-destruct">
-            TTL: {formatCountdown(msgRemainingMs)}
+          <span className="text-zinc-600">·</span>
+          <span className="inline-flex items-center gap-1 text-zinc-400">
+            <Clock className="w-2.5 h-2.5 text-emerald-400/80 shrink-0" />
+            <span>TTL: {formatCountdown(msgRemainingMs)}</span>
           </span>
         </div>
 
-        {/* Message Bubble with Strict Selection Lock (Decoupled from reaction row width) */}
+        {/* Message Bubble + Isolated Reaction Bar Wrapper */}
         <div
-          className={`flex flex-col max-w-[88%] sm:max-w-xl select-none ${
+          className={`relative flex flex-col max-w-[85%] sm:max-w-[72%] select-none ${
             isMine ? 'items-end' : 'items-start'
           }`}
         >
-          <div className="relative group w-fit max-w-full select-none">
-            <div
-              onClick={() => handleBubbleTap(msg.id, msg.room_id)}
-              onDoubleClick={() => triggerMessageReaction(msg.id, msg.room_id, '❤️', 'add')}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                openReactionMenuForMessage(msg.id, msg.room_id);
-              }}
-              onPointerDown={() => handleBubblePointerDown(msg.id, msg.room_id)}
-              onPointerUp={handleBubblePointerUpOrLeave}
-              onPointerLeave={handleBubblePointerUpOrLeave}
-              onPointerCancel={handleBubblePointerUpOrLeave}
-              className={`relative cursor-pointer select-none transition-transform active:scale-[0.99] px-3.5 py-2.5 rounded-xl text-xs sm:text-sm leading-relaxed break-words overflow-hidden border ${
-                isMine
-                  ? 'bg-emerald-950/75 border-emerald-800/70 text-zinc-100'
-                  : 'bg-zinc-900/90 border-zinc-800 text-zinc-100'
-              }`}
-            >
-              {msg.content}
+          <div
+            onPointerDown={() => handleBubblePointerDown(msg.id, msg.room_id)}
+            onPointerUp={handleBubblePointerUpOrLeave}
+            onPointerLeave={handleBubblePointerUpOrLeave}
+            onPointerCancel={handleBubblePointerUpOrLeave}
+            onClick={() => handleBubbleTap(msg.id, msg.room_id)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              openReactionMenuForMessage(msg.id, msg.room_id);
+            }}
+            className={`relative w-fit max-w-full rounded-2xl transition-transform active:scale-[0.99] cursor-pointer select-none px-3.5 py-2.5 text-xs sm:text-sm leading-relaxed break-words ${
+              isMine
+                ? 'bg-emerald-500 text-zinc-950 font-medium rounded-br-xs'
+                : 'bg-zinc-900 border border-zinc-800 text-zinc-100 rounded-bl-xs'
+            }`}
+          >
+            {msg.content}
 
-              {/* Quick Hover Reaction Trigger on Desktop */}
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  openReactionMenuForMessage(msg.id, msg.room_id);
-                }}
-                className={`opacity-0 group-hover:opacity-100 transition-opacity absolute top-1 ${
-                  isMine ? '-left-7' : '-right-7'
-                } p-1 rounded-md bg-zinc-900/90 border border-zinc-800 text-zinc-400 hover:text-emerald-400 hidden sm:flex items-center justify-center cursor-pointer select-none`}
-                aria-label="Add reaction"
-              >
-                <Smile className="w-3.5 h-3.5" />
-              </button>
-
-              {/* Double-Tap Heart Burst Visual Indicator */}
-              {isHeartBursting && (
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center animate-ping text-2xl select-none">
-                  ❤️
-                </div>
-              )}
-            </div>
+            {/* Animated Floating Heart on Double-Tap */}
+            {isHeartBursting && (
+              <span className="pointer-events-none absolute -top-4 right-2 text-xl animate-bounce drop-shadow-md select-none">
+                ❤️
+              </span>
+            )}
           </div>
 
-          {/* Active Grouped Reaction Pills (Strictly constrained to max-w-[250px] without stretching bubble) */}
+          {/* Grouped Reaction Pills Container: Strict max-w-[250px] & flex-wrap so it never stretches the message bubble */}
           {groupedReactions.length > 0 && (
             <div
-              className={`flex flex-wrap items-center gap-1 mt-1 max-w-[250px] w-fit overflow-x-auto scrollbar-none select-none ${
+              className={`flex flex-wrap items-center gap-1 mt-1.5 max-w-[250px] max-h-20 overflow-y-auto scrollbar-none select-none ${
                 isMine ? 'justify-end' : 'justify-start'
               }`}
             >
@@ -1428,14 +1896,17 @@ export default function App() {
                     key={emoji}
                     type="button"
                     onClick={() => triggerMessageReaction(msg.id, msg.room_id, emoji, 'toggle')}
-                    className={`px-2 py-0.5 rounded-full text-[11px] leading-tight font-mono tabular-nums inline-flex items-center gap-1 shrink-0 backdrop-blur-md border transition-colors cursor-pointer select-none ${
+                    className={`px-2 py-0.5 rounded-full text-[11px] font-mono inline-flex items-center gap-1 transition-all cursor-pointer select-none shrink-0 backdrop-blur-md ${
                       iReacted
-                        ? 'bg-emerald-950/85 border-emerald-500/70 text-emerald-300 font-semibold shadow-sm'
-                        : 'bg-zinc-900/80 border-zinc-800/90 text-zinc-300 hover:border-zinc-700'
+                        ? 'bg-emerald-950/90 border border-emerald-500/70 text-emerald-300 shadow-xs'
+                        : 'bg-zinc-900/85 border border-zinc-800/90 text-zinc-300 hover:border-zinc-700'
                     }`}
+                    title={`Reacted by: ${users.join(', ')}`}
                   >
                     <span className="text-xs leading-none">{emoji}</span>
-                    <span className="text-[10px] leading-none">{count}</span>
+                    <span className="text-[10px] font-semibold leading-none tabular-nums">
+                      {count}
+                    </span>
                   </button>
                 );
               })}
@@ -1446,23 +1917,23 @@ export default function App() {
     );
   };
 
-  // Render Comprehensive Emoji Library Popover (Emoji-Only)
+  // Extensive Categorized Emoji Picker Popover (Pure Emoji Library)
   const renderEmojiPicker = () => {
     if (!pickerOpenFor) return null;
 
     return (
-      <div className="absolute bottom-14 left-2 right-2 sm:left-6 sm:right-auto z-30 bg-zinc-950/95 backdrop-blur-xl border border-zinc-800 rounded-2xl shadow-2xl sm:w-[410px] max-h-[340px] flex flex-col overflow-hidden select-none">
-        {/* Top Header */}
-        <div className="px-3 py-2 border-b border-zinc-800/80 flex items-center justify-between gap-2 shrink-0 bg-zinc-900/50">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400">
-            <Smile className="w-4 h-4 shrink-0" />
+      <div className="shrink-0 border-t border-zinc-800 bg-zinc-950/95 backdrop-blur-xl select-none flex flex-col max-h-64 sm:max-h-72 z-20">
+        {/* Top Bar: Header & Close */}
+        <div className="px-3 py-2 border-b border-zinc-800/80 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-400">
+            <Smile className="w-3.5 h-3.5 shrink-0" />
             <span>Emoji Library</span>
           </div>
 
           <button
             type="button"
             onClick={() => setPickerOpenFor(null)}
-            className="p-1 text-zinc-400 hover:text-zinc-100 rounded-md cursor-pointer"
+            className="p-1 text-zinc-400 hover:text-zinc-200 cursor-pointer"
             aria-label="Close emoji picker"
           >
             <X className="w-4 h-4" />
@@ -1518,7 +1989,7 @@ export default function App() {
   const sidebarContent = (
     <div className="flex flex-col justify-between h-full gap-5 select-none">
       <div className="space-y-5">
-        {/* 1. Immutable Random Identity Card (24-Hour Active Lifecycle) */}
+        {/* 1. Immutable Random Identity Card (1-Hour Active Lifecycle) */}
         <div className="space-y-1.5">
           <div className="flex items-center justify-between text-xs text-zinc-400">
             <span>Your Identity</span>
@@ -1693,11 +2164,11 @@ export default function App() {
         </div>
       </div>
 
-      {/* Minimalist TTL Indicator & Compact Sound Icon Toggle */}
+      {/* Minimalist 1h TTL Indicator & Compact Sound Icon Toggle */}
       <div className="pt-2.5 border-t border-zinc-800/80 flex items-center justify-between gap-2 text-xs text-zinc-400 shrink-0">
         <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-zinc-400">
           <Clock className="w-3 h-3 text-emerald-400 shrink-0" />
-          <span>24h Auto-Destruct</span>
+          <span>1h Auto-Destruct</span>
         </span>
         <button
           type="button"
@@ -1721,7 +2192,7 @@ export default function App() {
 
   return (
     <div
-      className="h-dvh w-full max-w-full overflow-hidden bg-black text-zinc-100 flex flex-col select-none"
+      className="h-dvh w-full max-w-full overflow-hidden bg-black text-zinc-100 flex flex-col select-none relative"
       onContextMenu={(e) => {
         const target = e.target as HTMLElement;
         if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
@@ -1730,6 +2201,24 @@ export default function App() {
         e.preventDefault();
       }}
     >
+      {/* Privacy Screen Blur Shield when Tab Loses Focus / Visibility */}
+      {isPrivacyBlurred && (
+        <div
+          onClick={() => setIsPrivacyBlurred(false)}
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xl flex flex-col items-center justify-center p-6 text-center select-none"
+        >
+          <div className="w-12 h-12 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center text-emerald-400 mb-3 shadow-2xl">
+            <EyeOff className="w-6 h-6" />
+          </div>
+          <p className="text-sm font-semibold text-zinc-100 tracking-tight">
+            Privacy Shield Active
+          </p>
+          <p className="text-xs text-zinc-400 mt-1">
+            Return to window to resume session
+          </p>
+        </div>
+      )}
+
       {/* Streamlined Top Header: App Title ("WhisperNet"), Tiny Sound Icon Toggle, and User ID Copy Button */}
       <header className="shrink-0 w-full max-w-full flex items-center justify-between gap-3 px-3.5 sm:px-6 py-2.5 sm:py-3 border-b border-zinc-800/80 bg-black/95 backdrop-blur-md z-30 select-none">
         <a
@@ -1778,13 +2267,17 @@ export default function App() {
         </div>
       </header>
 
-      {/* Real-Time In-App Notification Banner / Toast Stack */}
+      {/* Real-Time In-App Notification Banner / Toast Stack (5-Second Auto-Dismiss + Shrinking Progress Bar) */}
       {toastQueue.length > 0 && (
         <div className="fixed top-14 sm:top-auto sm:bottom-5 left-3 right-3 sm:left-auto sm:right-5 z-40 flex flex-col gap-2 sm:max-w-sm pointer-events-none select-none">
           {toastQueue.map((toast) => (
             <div
               key={toast.id}
-              className="pointer-events-auto bg-zinc-950/95 backdrop-blur-xl border border-emerald-500/80 rounded-xl p-3 sm:p-4 shadow-2xl flex flex-col gap-2 select-none"
+              className={`pointer-events-auto relative overflow-hidden bg-zinc-950/95 backdrop-blur-xl border border-emerald-500/80 rounded-xl p-3 sm:p-4 shadow-2xl flex flex-col gap-2 select-none transition-all duration-250 ease-out ${
+                toast.exiting
+                  ? 'opacity-0 translate-y-1 scale-95'
+                  : 'opacity-100 translate-y-0 scale-100'
+              }`}
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400 min-w-0">
@@ -1793,9 +2286,7 @@ export default function App() {
                 </div>
                 <button
                   type="button"
-                  onClick={() =>
-                    setToastQueue((prev) => prev.filter((item) => item.id !== toast.id))
-                  }
+                  onClick={() => dismissToast(toast.id)}
                   className="text-zinc-400 hover:text-zinc-200 cursor-pointer shrink-0"
                   aria-label="Dismiss notification"
                 >
@@ -1817,6 +2308,10 @@ export default function App() {
                   <span>Open Chat</span>
                   <ArrowRight className="w-3 h-3" />
                 </button>
+              </div>
+              {/* 5-Second Auto-Shrinking Progress Bar */}
+              <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 overflow-hidden">
+                <div className="h-full w-full bg-emerald-400/90 animate-toast-progress" />
               </div>
             </div>
           ))}
@@ -1905,7 +2400,7 @@ export default function App() {
 
             <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
               <span className="hidden md:inline text-[11px] font-mono text-zinc-400">
-                {onlineUsers.length} online · TTL: 24h
+                {onlineUsers.length} online · TTL: 1h
               </span>
               <button
                 type="button"
@@ -2144,7 +2639,7 @@ export default function App() {
                       </span>
                       <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-zinc-900/70 border border-zinc-800 text-xs text-zinc-300">
                         <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        <span>24h TTL</span>
+                        <span>1h TTL</span>
                       </span>
                     </div>
                   </div>
@@ -2161,8 +2656,20 @@ export default function App() {
                           {activePeerId}
                         </span>
                         <span className="text-zinc-600 shrink-0">·</span>
-                        <span className="text-[11px] font-normal text-zinc-400 shrink-0">
-                          {peerOnline ? 'Online' : 'Offline'}
+                        <span
+                          className={`text-[11px] font-normal shrink-0 ${
+                            peerDisconnected
+                              ? 'text-rose-400 font-medium'
+                              : peerOnline
+                              ? 'text-emerald-400'
+                              : 'text-zinc-400'
+                          }`}
+                        >
+                          {peerDisconnected
+                            ? 'Disconnected / Left'
+                            : peerOnline
+                            ? 'Online'
+                            : 'Offline'}
                         </span>
                       </div>
                       <div className="flex items-center gap-1.5 text-[10px] sm:text-xs text-zinc-400 font-mono tabular-nums truncate">
@@ -2175,8 +2682,10 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
+                          closeWebRtcChannel();
                           setActiveRoom(null);
                           setActivePeerId(null);
+                          setPeerDisconnected(false);
                           setPickerOpenFor(null);
                         }}
                         className="px-2.5 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
@@ -2207,31 +2716,42 @@ export default function App() {
                       privateMessages.map((msg) => renderMessageItem(msg, false))
                     )}
 
-                    {peerTyping && (
+                    {peerTyping && !peerDisconnected && (
                       <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
                         <span>{activePeerId} is typing...</span>
+                      </div>
+                    )}
+
+                    {/* Non-Intrusive Status Banner when Partner Disconnected / Reset Identity */}
+                    {peerDisconnected && (
+                      <div className="my-2 px-3.5 py-2.5 rounded-xl bg-zinc-900/90 border border-rose-800/60 text-center flex items-center justify-center gap-2 text-xs text-rose-300 select-none">
+                        <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                        <span>Partner disconnected / left the channel</span>
                       </div>
                     )}
                     <div ref={privateEndRef} />
                   </div>
 
                   {/* Extensive Emoji Library Popover */}
-                  {pickerOpenFor === 'private' && renderEmojiPicker()}
+                  {pickerOpenFor === 'private' && !peerDisconnected && renderEmojiPicker()}
 
-                  {/* Fixed Bottom Private Message Input Composer */}
+                  {/* Fixed Bottom Private Message Input Composer (Disabled if Partner Disconnected) */}
                   <form
                     onSubmit={handleSendPrivateMessage}
                     className="shrink-0 p-2.5 sm:p-3.5 border-t border-zinc-800/80 bg-zinc-950/90 flex items-center gap-2 w-full max-w-full"
                   >
                     <button
                       type="button"
+                      disabled={peerDisconnected}
                       onClick={() =>
                         setPickerOpenFor((prev) => (prev === 'private' ? null : 'private'))
                       }
-                      className={`p-2 sm:p-2.5 rounded-lg border transition-colors shrink-0 cursor-pointer flex items-center gap-1 ${
-                        pickerOpenFor === 'private'
-                          ? 'bg-zinc-800 border-emerald-500/60 text-emerald-400'
-                          : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                      className={`p-2 sm:p-2.5 rounded-lg border transition-colors shrink-0 flex items-center gap-1 ${
+                        peerDisconnected
+                          ? 'bg-zinc-900/40 border-zinc-800/50 text-zinc-600 cursor-not-allowed opacity-50'
+                          : pickerOpenFor === 'private'
+                          ? 'bg-zinc-800 border-emerald-500/60 text-emerald-400 cursor-pointer'
+                          : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200 cursor-pointer'
                       }`}
                       title="Open Emoji Picker"
                       aria-label="Open Emoji Picker"
@@ -2241,16 +2761,21 @@ export default function App() {
                     <input
                       ref={privateInputRef}
                       type="text"
+                      disabled={peerDisconnected}
                       value={privateDraft}
                       onChange={(e) => handlePrivateDraftChange(e.target.value)}
-                      placeholder={`Message ${activePeerId}...`}
+                      placeholder={
+                        peerDisconnected
+                          ? 'Partner disconnected / left the channel'
+                          : `Message ${activePeerId}...`
+                      }
                       maxLength={4000}
-                      className="select-text min-w-0 flex-1 px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 transition-colors"
+                      className="select-text min-w-0 flex-1 px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                     />
                     <button
                       type="submit"
-                      disabled={!privateDraft.trim() || isSendingPrivate}
-                      className="px-3.5 sm:px-5 py-2 sm:py-2.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-950 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                      disabled={peerDisconnected || !privateDraft.trim() || isSendingPrivate}
+                      className="px-3.5 sm:px-5 py-2 sm:py-2.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-950 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <span>Send</span>
                       <Send className="w-3.5 h-3.5 shrink-0" />
@@ -2296,53 +2821,52 @@ export default function App() {
                       'toggle'
                     )
                   }
-                  className="p-2 text-xl hover:bg-zinc-800 active:scale-110 rounded-xl transition-all flex items-center justify-center cursor-pointer select-none"
+                  className="p-2 text-xl hover:bg-zinc-800 active:scale-125 rounded-xl transition-all flex items-center justify-center cursor-pointer select-none"
                 >
                   {emoji}
                 </button>
               ))}
             </div>
             {showFirstTimeReactionTip && (
-              <p className="text-[11px] text-zinc-500 text-center">
-                Double-tap any message bubble for a quick ❤️ reaction
+              <p className="text-[11px] text-zinc-500 text-center pt-1">
+                Tip: Double-tap any message to quickly send ❤️
               </p>
             )}
           </div>
         </div>
       )}
 
-      {/* Confirmation Modal for "Nuke Chat" */}
+      {/* Nuke Confirmation Modal */}
       {showNukeModal && activeRoom && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 select-none"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="nuke-modal-title"
-        >
-          <div className="max-w-md w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-5 sm:p-6 space-y-4 shadow-2xl select-none">
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 select-none">
+          <div className="max-w-md w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-5 sm:p-6 space-y-5 shadow-2xl">
             <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="w-9 h-9 rounded-lg bg-rose-950 border border-rose-800/80 flex items-center justify-center text-rose-400 shrink-0">
-                  <Trash2 className="w-4 h-4" />
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-rose-950/80 border border-rose-800 flex items-center justify-center text-rose-400 shrink-0">
+                  <Trash2 className="w-5 h-5" />
                 </div>
-                <div className="min-w-0">
-                  <h2 id="nuke-modal-title" className="text-sm sm:text-base font-bold text-zinc-100">
-                    Confirm Nuke Chat?
-                  </h2>
-                  <p className="text-xs font-mono text-zinc-400 truncate">{activeRoom.room_id}</p>
+                <div>
+                  <h3 className="text-base font-bold text-zinc-100">
+                    Execute Bilateral Room Nuke?
+                  </h3>
+                  <p className="text-xs font-mono text-rose-400">
+                    Target Peer: {activePeerId}
+                  </p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => setShowNukeModal(false)}
-                className="text-zinc-400 hover:text-zinc-200 cursor-pointer shrink-0"
+                className="text-zinc-500 hover:text-zinc-300 cursor-pointer"
               >
-                <X className="w-4 h-4" />
+                <X className="w-5 h-5" />
               </button>
             </div>
 
-            <p className="text-xs text-zinc-300 leading-relaxed">
-              This action will <strong className="text-rose-400">permanently and irreversibly delete</strong> all private chat history, reactions, and room records for both you (<code className="font-mono">{myId}</code>) and your peer (<code className="font-mono">{activePeerId}</code>) in real time.
+            <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed">
+              This action immediately executes an irreversible purge for all messages and room metadata between{' '}
+              <strong className="font-mono text-zinc-100">{myId}</strong> and{' '}
+              <strong className="font-mono text-zinc-100">{activePeerId}</strong>. Both screens will be cleared in real time.
             </p>
 
             <div className="flex items-center justify-end gap-2.5 pt-2">
@@ -2350,7 +2874,7 @@ export default function App() {
                 type="button"
                 onClick={() => setShowNukeModal(false)}
                 disabled={isNuking}
-                className="px-3.5 py-2 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-200 rounded-lg transition-colors cursor-pointer"
+                className="px-4 py-2 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-300 rounded-lg transition-colors cursor-pointer"
               >
                 Cancel
               </button>
@@ -2358,10 +2882,10 @@ export default function App() {
                 type="button"
                 onClick={handleConfirmNuke}
                 disabled={isNuking}
-                className="px-3.5 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
               >
-                <Flame className="w-3.5 h-3.5 shrink-0" />
-                <span>{isNuking ? 'Nuking...' : 'Confirm Nuke Chat'}</span>
+                <Flame className="w-3.5 h-3.5" />
+                <span>{isNuking ? 'Wiping...' : 'Confirm Nuke'}</span>
               </button>
             </div>
           </div>

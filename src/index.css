@@ -57,6 +57,20 @@
   display: none;
 }
 
+@keyframes toastProgressShrink {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+.animate-toast-progress {
+  transform-origin: left center;
+  animation: toastProgressShrink 5000ms linear forwards;
+}
+
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;

@@ -12,17 +12,19 @@ export interface StoredEcdhIdentity {
   createdAt?: number;
 }
 
-const IDENTITY_TTL_MS = 24 * 60 * 60 * 1000;
+const IDENTITY_TTL_MS = 60 * 60 * 1000; // 1 Hour TTL
 
 let cachedMyKeyPair: CryptoKeyPair | null = null;
 let cachedMyPublicJwkStr: string | null = null;
 const peerPublicKeyStore = new Map<string, string>();
 const derivedRoomKeyCache = new Map<string, CryptoKey>();
+const decryptedPayloadCache = new Map<string, string>();
 
 export function resetMyEcdhIdentity(): void {
   cachedMyKeyPair = null;
   cachedMyPublicJwkStr = null;
   derivedRoomKeyCache.clear();
+  decryptedPayloadCache.clear();
   try {
     localStorage.removeItem(ECDH_IDENTITY_STORAGE_KEY);
     sessionStorage.removeItem(ECDH_IDENTITY_STORAGE_KEY);
@@ -275,7 +277,7 @@ export async function encryptMessageContent(
   return `${E2EE_ENVELOPE_PREFIX}${modeFlag}:${ivB64}:${cipherB64}`;
 }
 
-// Decrypt AES-256-GCM ciphertext exclusively on the client browser
+// Decrypt AES-256-GCM ciphertext exclusively on the client browser (with bounded in-memory LRU cache)
 export async function decryptMessageContent(
   payload: string,
   roomId: string,
@@ -283,6 +285,13 @@ export async function decryptMessageContent(
 ): Promise<string> {
   if (!payload || !payload.startsWith(E2EE_ENVELOPE_PREFIX)) {
     return payload;
+  }
+
+  const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
+  const cacheKey = `${roomId}::${cleanPeer}::${payload}`;
+  const cachedPlaintext = decryptedPayloadCache.get(cacheKey);
+  if (cachedPlaintext !== undefined) {
+    return cachedPlaintext;
   }
 
   try {
@@ -306,7 +315,6 @@ export async function decryptMessageContent(
 
     const iv = base64ToBytes(ivB64);
     const cipherBytes = base64ToBytes(cipherB64);
-    const cleanPeer = peerId ? peerId.trim().toUpperCase() : '';
 
     if (modeFlag === 'E' && cleanPeer) {
       try {
@@ -316,7 +324,13 @@ export async function decryptMessageContent(
           ecdhKey,
           cipherBytes
         );
-        return new TextDecoder().decode(decryptedBuffer);
+        const decoded = new TextDecoder().decode(decryptedBuffer);
+        if (decryptedPayloadCache.size > 600) {
+          const firstKey = decryptedPayloadCache.keys().next().value;
+          if (firstKey) decryptedPayloadCache.delete(firstKey);
+        }
+        decryptedPayloadCache.set(cacheKey, decoded);
+        return decoded;
       } catch {
         // Fallback attempt with deterministic room key
       }
@@ -328,8 +342,14 @@ export async function decryptMessageContent(
       detKey,
       cipherBytes
     );
-    return new TextDecoder().decode(decryptedBuffer);
+    const decoded = new TextDecoder().decode(decryptedBuffer);
+    if (decryptedPayloadCache.size > 600) {
+      const firstKey = decryptedPayloadCache.keys().next().value;
+      if (firstKey) decryptedPayloadCache.delete(firstKey);
+    }
+    decryptedPayloadCache.set(cacheKey, decoded);
+    return decoded;
   } catch {
-    return '🔒 [End-to-End Encrypted Message]';
+    return '[Encrypted Message]';
   }
 }
