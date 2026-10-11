@@ -902,6 +902,9 @@ export default function App() {
         });
         const data = await res.json();
         previousUserIdRef.current = null;
+        if (active && Array.isArray(data?.onlineUsers)) {
+          setOnlineUsers(data.onlineUsers);
+        }
         if (active && data?.ok && data.userId && data.userId !== myId) {
           const now = Date.now();
           const newExpiresAt = now + TTL_MS;
@@ -934,19 +937,29 @@ export default function App() {
     };
   }, [myId]);
 
-  // Fetch & Decrypt Global Public Chat Messages
+  // Fetch & Decrypt Global Public Chat Messages + Sync Active Online Users
   const fetchGlobalMessages = useCallback(async () => {
     try {
-      const res = await fetch('/api/global/messages');
+      const res = await fetch(`/api/global/messages?myId=${encodeURIComponent(myId)}`);
       const data = await res.json();
-      if (data && data.ok && Array.isArray(data.messages)) {
-        const decrypted = await decryptMessageBatch(data.messages, 'GLOBAL');
-        setGlobalMessages(decrypted);
+      if (data && data.ok) {
+        if (Array.isArray(data.onlineUsers)) {
+          const currentOnline: string[] = data.onlineUsers;
+          setOnlineUsers(currentOnline);
+          if (activePeerIdRef.current && currentOnline.includes(activePeerIdRef.current)) {
+            setPeerOnline(true);
+            setPeerDisconnected(false);
+          }
+        }
+        if (Array.isArray(data.messages)) {
+          const decrypted = await decryptMessageBatch(data.messages, 'GLOBAL');
+          setGlobalMessages(decrypted);
+        }
       }
     } catch {
       // Ignore transient error
     }
-  }, []);
+  }, [myId]);
 
   // Fetch & Decrypt All Active 1-on-1 Private Conversations
   const fetchConversations = useCallback(async () => {
@@ -1215,8 +1228,9 @@ export default function App() {
           registerPeerPublicKey(targetPeer, data.room.peer_public_key);
         }
 
-        const isPeerDead = data.room?.peer_alive === false;
-        setDisconnectedPeersMap((prev) => ({ ...prev, [targetPeer]: isPeerDead }));
+        const isPeerOnline =
+          data.room?.peer_alive !== false || onlineUsers.includes(targetPeer);
+        setDisconnectedPeersMap((prev) => ({ ...prev, [targetPeer]: !isPeerOnline }));
 
         // Automatically derive temporary cryptographic session key & attach URL #hash secret
         const currentHashCtx = parseUrlHashContext();
@@ -1241,7 +1255,8 @@ export default function App() {
         activePeerIdRef.current = targetPeer;
         setActiveRoom(data.room);
         activeRoomIdRef.current = data.room?.room_id || null;
-        setPeerDisconnected(data.room?.peer_alive === false);
+        setPeerOnline(isPeerOnline);
+        setPeerDisconnected(false);
         setPrivateMessages(decryptedMessages);
         setActiveTab('private');
         setPeerInput('');
@@ -1833,7 +1848,13 @@ export default function App() {
             closeWebRtcChannel();
             setPeerOnline(false);
             setPeerTyping(false);
-            setPeerDisconnected(true);
+          } else if (data.peerAlive === true) {
+            setPeerOnline(true);
+            setPeerDisconnected(false);
+            if (activePeerIdRef.current) {
+              const currentPeer = activePeerIdRef.current;
+              setDisconnectedPeersMap((prev) => ({ ...prev, [currentPeer]: false }));
+            }
           }
 
           if (Array.isArray(data.messages)) {
@@ -2738,11 +2759,11 @@ export default function App() {
                 const isSelected =
                   activeTab === 'private' && activePeerId === conv.peer_id;
                 const unreadCount = unreadByPeer[conv.peer_id] || 0;
-                const isPeerOnlineNow = onlineUsers.includes(conv.peer_id);
+                const isPeerOnlineNow =
+                  conv.peer_alive !== false || onlineUsers.includes(conv.peer_id);
                 const isPeerDisconnectedCard =
-                  conv.peer_alive === false ||
-                  Boolean(disconnectedPeersMap[conv.peer_id]) ||
-                  !isPeerOnlineNow;
+                  (conv.peer_alive === false && !onlineUsers.includes(conv.peer_id)) ||
+                  Boolean(disconnectedPeersMap[conv.peer_id]);
 
                 return (
                   <div
@@ -3287,11 +3308,11 @@ export default function App() {
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {conversations.map((conv) => {
                             const unreadCount = unreadByPeer[conv.peer_id] || 0;
-                            const isPeerOnlineNow = onlineUsers.includes(conv.peer_id);
+                            const isPeerOnlineNow =
+                              conv.peer_alive !== false || onlineUsers.includes(conv.peer_id);
                             const isPeerDisconnectedCard =
-                              conv.peer_alive === false ||
-                              Boolean(disconnectedPeersMap[conv.peer_id]) ||
-                              !isPeerOnlineNow;
+                              (conv.peer_alive === false && !onlineUsers.includes(conv.peer_id)) ||
+                              Boolean(disconnectedPeersMap[conv.peer_id]);
 
                             return (
                               <div

@@ -281,15 +281,6 @@ async function startServer() {
     }
   }
 
-  function doesUserExistOrOnline(targetUserId: string): boolean {
-    const cleanTarget = normalizeCode(targetUserId);
-    if (!cleanTarget || cleanTarget.length < 4) return false;
-    if (isUserCurrentlyOnline(cleanTarget)) return true;
-    const cutoff = Date.now() - TTL_MS;
-    const record = memoryActiveUsers.get(cleanTarget);
-    return Boolean(record && record.last_seen >= cutoff);
-  }
-
   function severStaleIdentity(staleUserId: string) {
     const cleanStale = normalizeCode(staleUserId);
     if (!cleanStale) return;
@@ -356,17 +347,34 @@ async function startServer() {
     registerActiveIdentity(cleanUserId, publicKey);
   }
 
-  function broadcastGlobalPresence() {
+  function getActiveOnlineUserIds(): string[] {
+    const cutoff = Date.now() - TTL_MS;
     const onlineUsers = new Set<string>();
     for (const c of allClients) {
       if (c.readyState === WebSocket.OPEN && c.userId) {
         onlineUsers.add(c.userId);
       }
     }
+    for (const [uid, record] of memoryActiveUsers.entries()) {
+      if (record.last_seen >= cutoff) {
+        onlineUsers.add(uid);
+      }
+    }
+    const globalMsgs = memoryMessages.get(GLOBAL_ROOM_ID) || [];
+    for (const m of globalMsgs) {
+      if (m.timestamp >= cutoff && m.sender_id) {
+        onlineUsers.add(normalizeCode(m.sender_id));
+      }
+    }
+    return Array.from(onlineUsers);
+  }
+
+  function broadcastGlobalPresence() {
+    const users = getActiveOnlineUserIds();
     broadcastToAll({
       type: 'global:presence',
-      users: Array.from(onlineUsers),
-      onlineCount: onlineUsers.size,
+      users,
+      onlineCount: users.length,
     });
   }
 
@@ -380,12 +388,35 @@ async function startServer() {
         }
       }
     }
+    const parts = roomId.split('__');
+    if (parts.length === 2) {
+      if (doesUserExistOrOnline(parts[0])) activeUsers.add(parts[0]);
+      if (doesUserExistOrOnline(parts[1])) activeUsers.add(parts[1]);
+    }
     broadcastToRoom(roomId, {
       type: 'room:presence',
       roomId,
       participants: Array.from(activeUsers),
       onlineCount: activeUsers.size,
     });
+  }
+
+  function doesUserExistOrOnline(targetUserId: string): boolean {
+    const cleanTarget = normalizeCode(targetUserId);
+    if (!cleanTarget || cleanTarget.length < 4) return false;
+    if (isUserCurrentlyOnline(cleanTarget)) return true;
+    const cutoff = Date.now() - TTL_MS;
+    const record = memoryActiveUsers.get(cleanTarget);
+    if (record && record.last_seen >= cutoff) return true;
+    // Also recognize users who sent messages in Global Chat or any active room within the 1h TTL
+    for (const msgList of memoryMessages.values()) {
+      for (const m of msgList) {
+        if (m.timestamp >= cutoff && normalizeCode(m.sender_id) === cleanTarget) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   wss.on('connection', (ws: WsClient) => {
@@ -561,10 +592,12 @@ async function startServer() {
       }
 
       registerActiveIdentity(userId, publicKey);
+      broadcastGlobalPresence();
       res.status(200).json({
         ok: true,
         userId,
         collisionResolved,
+        onlineUsers: getActiveOnlineUserIds(),
         timestamp: Date.now(),
       });
     } catch {
@@ -664,11 +697,16 @@ async function startServer() {
     }
   });
 
-  // Get Global Public Chat Messages (Last 1h) + Reactions
-  app.get('/api/global/messages', (_req, res) => {
+  // Get Global Public Chat Messages (Last 1h) + Reactions + Online Users
+  app.get('/api/global/messages', (req, res) => {
     try {
       cleanupExpiredData();
       ensureGlobalRoomExists();
+
+      const requesterId = normalizeCode(String(req.query.myId || ''));
+      if (requesterId && /^USER-[A-Z0-9]{4,8}$/.test(requesterId)) {
+        registerActiveIdentity(requesterId);
+      }
 
       const cutoff = Date.now() - TTL_MS;
       const rawMsgs = (memoryMessages.get(GLOBAL_ROOM_ID) || []).filter(
@@ -689,6 +727,7 @@ async function startServer() {
         ok: true,
         roomId: GLOBAL_ROOM_ID,
         messages,
+        onlineUsers: getActiveOnlineUserIds(),
       });
     } catch (error) {
       res.status(500).json({
@@ -811,14 +850,6 @@ async function startServer() {
       }
 
       const peerAlive = doesUserExistOrOnline(peerId);
-      if (!peerAlive && !roomObj) {
-        res.status(404).json({
-          ok: false,
-          error: 'User not found. Please check the ID and try again.',
-        });
-        return;
-      }
-
       const isNewRoom = !roomObj;
       if (!roomObj) {
         roomObj = { room_id: roomId, created_at: now };
@@ -956,14 +987,6 @@ async function startServer() {
       }
 
       const recipientId = extractPeerFromRoomId(roomId, senderId);
-      if (recipientId && !doesUserExistOrOnline(recipientId)) {
-        res.status(410).json({
-          ok: false,
-          peerDisconnected: true,
-          error: 'Partner disconnected / left the channel',
-        });
-        return;
-      }
 
       registerActiveIdentity(senderId);
 

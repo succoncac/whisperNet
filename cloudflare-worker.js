@@ -348,15 +348,32 @@ export class WhisperNetHub {
     }
   }
 
-  broadcastGlobalPresence() {
+  getActiveOnlineUserIds() {
+    const cutoff = Date.now() - TTL_MS;
     const online = new Set();
     for (const c of this.clients) {
       if (c.userId) online.add(c.userId);
     }
+    for (const [uid, record] of this.activeUsers.entries()) {
+      if (record.last_seen >= cutoff) {
+        online.add(uid);
+      }
+    }
+    const globalMsgs = this.messages.get(GLOBAL_ROOM_ID) || [];
+    for (const m of globalMsgs) {
+      if (m.timestamp >= cutoff && m.sender_id) {
+        online.add(normalizeCode(m.sender_id));
+      }
+    }
+    return Array.from(online);
+  }
+
+  broadcastGlobalPresence() {
+    const users = this.getActiveOnlineUserIds();
     this.broadcastToAll({
       type: 'global:presence',
-      users: Array.from(online),
-      onlineCount: online.size,
+      users,
+      onlineCount: users.length,
     });
   }
 
@@ -366,6 +383,11 @@ export class WhisperNetHub {
       if (c.roomId === roomId && c.userId) {
         active.add(c.userId);
       }
+    }
+    const parts = String(roomId).split('__');
+    if (parts.length === 2) {
+      if (this.doesUserExistOrOnline(parts[0])) active.add(parts[0]);
+      if (this.doesUserExistOrOnline(parts[1])) active.add(parts[1]);
     }
     this.broadcastToRoom(roomId, {
       type: 'room:presence',
@@ -381,7 +403,15 @@ export class WhisperNetHub {
     if (this.isUserCurrentlyOnline(cleanTarget)) return true;
     const cutoff = Date.now() - TTL_MS;
     const record = this.activeUsers.get(cleanTarget);
-    return Boolean(record && record.last_seen >= cutoff);
+    if (record && record.last_seen >= cutoff) return true;
+    for (const msgList of this.messages.values()) {
+      for (const m of msgList) {
+        if (m.timestamp >= cutoff && normalizeCode(m.sender_id) === cleanTarget) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   async fetch(request) {
@@ -519,11 +549,13 @@ export class WhisperNetHub {
       }
 
       this.registerIdentity(userId, publicKey);
+      this.broadcastGlobalPresence();
       return jsonResponse(
         {
           ok: true,
           userId,
           collisionResolved,
+          onlineUsers: this.getActiveOnlineUserIds(),
           timestamp: Date.now(),
         },
         200,
@@ -544,6 +576,10 @@ export class WhisperNetHub {
 
     // GET /api/global/messages
     if (pathname === '/api/global/messages' && request.method === 'GET') {
+      const requesterId = normalizeCode(url.searchParams.get('myId') || '');
+      if (requesterId && /^USER-[A-Z0-9]{4,8}$/.test(requesterId)) {
+        this.registerIdentity(requesterId);
+      }
       const cutoff = Date.now() - TTL_MS;
       const rawMsgs = (this.messages.get(GLOBAL_ROOM_ID) || []).filter(
         (m) => m.timestamp >= cutoff
@@ -557,7 +593,17 @@ export class WhisperNetHub {
         timestamp: Number(r.timestamp),
         reactions: reactionsByMsg[String(r.id)] || {},
       }));
-      return jsonResponse({ ok: true, roomId: GLOBAL_ROOM_ID, messages }, 200, request, this.env);
+      return jsonResponse(
+        {
+          ok: true,
+          roomId: GLOBAL_ROOM_ID,
+          messages,
+          onlineUsers: this.getActiveOnlineUserIds(),
+        },
+        200,
+        request,
+        this.env
+      );
     }
 
     // POST /api/global/messages
@@ -650,15 +696,6 @@ export class WhisperNetHub {
       }
 
       const peerAlive = this.doesUserExistOrOnline(peerId);
-      if (!peerAlive && !roomObj) {
-        return jsonResponse(
-          { ok: false, error: 'User not found. Please check the ID and try again.' },
-          404,
-          request,
-          this.env
-        );
-      }
-
       const isNewRoom = !roomObj;
       if (!roomObj) {
         roomObj = { room_id: roomId, created_at: now };
@@ -823,18 +860,6 @@ export class WhisperNetHub {
       }
 
       const recipientId = extractPeerFromRoomId(roomId, senderId);
-      if (recipientId && !this.doesUserExistOrOnline(recipientId)) {
-        return jsonResponse(
-          {
-            ok: false,
-            peerDisconnected: true,
-            error: 'Partner disconnected / left the channel',
-          },
-          410,
-          request,
-          this.env
-        );
-      }
 
       this.registerIdentity(senderId);
       if (!this.rooms.has(roomId)) {
