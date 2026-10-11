@@ -29,6 +29,7 @@ export interface MessageRowFormatted {
 interface InMemoryRoom {
   room_id: string;
   created_at: number;
+  updated_at?: number;
 }
 
 interface InMemoryMessage {
@@ -56,6 +57,7 @@ const memoryRooms = new Map<string, InMemoryRoom>();
 const memoryMessages = new Map<string, InMemoryMessage[]>();
 const memoryActiveUsers = new Map<string, InMemoryActiveUser>();
 const memoryMessageReactions = new Map<string, InMemoryReactionRecord>();
+const nukedRooms = new Map<string, number>();
 
 export function normalizeCode(code: string): string {
   return String(code || '')
@@ -213,14 +215,21 @@ async function startServer() {
     }
 
     for (const [roomId, roomObj] of memoryRooms.entries()) {
-      if (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff) {
+      const lastActive = roomObj.updated_at || roomObj.created_at;
+      const roomMsgs = memoryMessages.get(roomId) || [];
+      if (roomId !== GLOBAL_ROOM_ID && lastActive < cutoff && roomMsgs.length === 0) {
         deletedRooms++;
         memoryRooms.delete(roomId);
-        const roomMsgs = memoryMessages.get(roomId) || [];
         for (const m of roomMsgs) {
           memoryMessageReactions.delete(m.id);
         }
         memoryMessages.delete(roomId);
+      }
+    }
+
+    for (const [roomId, nukedAt] of nukedRooms.entries()) {
+      if (nukedAt < cutoff) {
+        nukedRooms.delete(roomId);
       }
     }
 
@@ -654,7 +663,8 @@ async function startServer() {
       const conversations = [];
 
       for (const [roomId, roomObj] of memoryRooms.entries()) {
-        if (roomId === GLOBAL_ROOM_ID || roomObj.created_at < cutoff) continue;
+        const lastActive = roomObj.updated_at || roomObj.created_at;
+        if (roomId === GLOBAL_ROOM_ID || lastActive < cutoff) continue;
         if (!roomId.startsWith(`${myId}__`) && !roomId.endsWith(`__${myId}`)) continue;
 
         const createdAt = Number(roomObj.created_at);
@@ -843,18 +853,21 @@ async function startServer() {
       const cutoff = now - TTL_MS;
 
       let roomObj = memoryRooms.get(roomId);
-      if (roomObj && roomObj.created_at < cutoff) {
+      if (roomObj && (roomObj.updated_at || roomObj.created_at) < cutoff) {
         memoryRooms.delete(roomId);
         memoryMessages.delete(roomId);
         roomObj = undefined;
       }
 
+      nukedRooms.delete(roomId);
       const peerAlive = doesUserExistOrOnline(peerId);
       const isNewRoom = !roomObj;
       if (!roomObj) {
-        roomObj = { room_id: roomId, created_at: now };
+        roomObj = { room_id: roomId, created_at: now, updated_at: now };
         memoryRooms.set(roomId, roomObj);
         memoryMessages.set(roomId, []);
+      } else {
+        roomObj.updated_at = now;
       }
 
       const createdAt = Number(roomObj.created_at);
@@ -915,20 +928,33 @@ async function startServer() {
         return;
       }
 
-      const cutoff = Date.now() - TTL_MS;
-      const roomObj = memoryRooms.get(roomId);
-      if (!roomObj || (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff)) {
-        res.status(200).json({
-          ok: true,
-          roomExists: false,
-          room: null,
-          messages: [],
-        });
-        return;
+      const now = Date.now();
+      const cutoff = now - TTL_MS;
+      const requesterId = normalizeCode(String(req.query.myId || ''));
+      if (requesterId && /^USER-[A-Z0-9]{4,8}$/.test(requesterId)) {
+        registerActiveIdentity(requesterId);
       }
 
+      let roomObj = memoryRooms.get(roomId);
+      if (!roomObj || (roomId !== GLOBAL_ROOM_ID && (roomObj.updated_at || roomObj.created_at) < cutoff)) {
+        if (nukedRooms.has(roomId)) {
+          res.status(200).json({
+            ok: true,
+            roomExists: false,
+            nuked: true,
+            room: null,
+            messages: [],
+          });
+          return;
+        }
+        // Auto-recover active room if user is still polling it and it wasn't explicitly nuked
+        roomObj = { room_id: roomId, created_at: now, updated_at: now };
+        memoryRooms.set(roomId, roomObj);
+        if (!memoryMessages.has(roomId)) {
+          memoryMessages.set(roomId, []);
+        }
+      }
       const createdAt = Number(roomObj.created_at);
-      const requesterId = normalizeCode(String(req.query.myId || ''));
       const peerId = requesterId ? extractPeerFromRoomId(roomId, requesterId) : null;
       const peerAlive = peerId ? doesUserExistOrOnline(peerId) : true;
 
@@ -994,8 +1020,12 @@ async function startServer() {
       const messageId =
         clientMsgId || `MSG-${now}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
 
-      if (!memoryRooms.has(roomId)) {
-        memoryRooms.set(roomId, { room_id: roomId, created_at: now });
+      nukedRooms.delete(roomId);
+      const existingRoom = memoryRooms.get(roomId);
+      if (!existingRoom) {
+        memoryRooms.set(roomId, { room_id: roomId, created_at: now, updated_at: now });
+      } else {
+        existingRoom.updated_at = now;
       }
 
       const roomList = memoryMessages.get(roomId) || [];
@@ -1144,6 +1174,7 @@ async function startServer() {
       }
       memoryMessages.delete(roomId);
       memoryRooms.delete(roomId);
+      nukedRooms.set(roomId, Date.now());
 
       const nukePayload = {
         type: 'room:nuked',

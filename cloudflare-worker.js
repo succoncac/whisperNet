@@ -80,10 +80,11 @@ export class WhisperNetHub {
 
     // Pure In-Memory Ephemeral RAM Storage Only (Zero Persistent Disk Storage)
     this.clients = new Set(); // Set<{ ws, userId, roomId }>
-    this.rooms = new Map(); // Map<roomId, { room_id, created_at }>
+    this.rooms = new Map(); // Map<roomId, { room_id, created_at, updated_at }>
     this.messages = new Map(); // Map<roomId, Array<{ id, room_id, sender_id, content, timestamp }>>
     this.activeUsers = new Map(); // Map<userId, { user_id, last_seen, public_key }>
     this.messageReactions = new Map(); // Map<messageId, { roomId, timestamp, reactions: Map<emoji, Set<userId>> }>
+    this.nukedRooms = new Map(); // Map<roomId, number>
 
     this.ensureGlobalRoomExists();
   }
@@ -137,17 +138,24 @@ export class WhisperNetHub {
       }
     }
 
-    // 2. Purge expired private rooms from in-memory RAM Map
+    // 2. Purge expired private rooms from in-memory RAM Map only when inactive for 1h and empty
     for (const [roomId, roomObj] of this.rooms.entries()) {
-      if (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff) {
+      const lastActive = roomObj.updated_at || roomObj.created_at;
+      const roomMsgs = this.messages.get(roomId) || [];
+      if (roomId !== GLOBAL_ROOM_ID && lastActive < cutoff && roomMsgs.length === 0) {
         expiredDetected = true;
         deletedRooms++;
         this.rooms.delete(roomId);
-        const roomMsgs = this.messages.get(roomId) || [];
         for (const m of roomMsgs) {
           this.messageReactions.delete(m.id);
         }
         this.messages.delete(roomId);
+      }
+    }
+
+    for (const [roomId, nukedAt] of this.nukedRooms.entries()) {
+      if (nukedAt < cutoff) {
+        this.nukedRooms.delete(roomId);
       }
     }
 
@@ -689,18 +697,21 @@ export class WhisperNetHub {
       const cutoff = now - TTL_MS;
 
       let roomObj = this.rooms.get(roomId);
-      if (roomObj && roomObj.created_at < cutoff) {
+      if (roomObj && (roomObj.updated_at || roomObj.created_at) < cutoff) {
         this.rooms.delete(roomId);
         this.messages.delete(roomId);
         roomObj = undefined;
       }
 
+      this.nukedRooms.delete(roomId);
       const peerAlive = this.doesUserExistOrOnline(peerId);
       const isNewRoom = !roomObj;
       if (!roomObj) {
-        roomObj = { room_id: roomId, created_at: now };
+        roomObj = { room_id: roomId, created_at: now, updated_at: now };
         this.rooms.set(roomId, roomObj);
         this.messages.set(roomId, []);
+      } else {
+        roomObj.updated_at = now;
       }
 
       const createdAt = Number(roomObj.created_at);
@@ -759,7 +770,8 @@ export class WhisperNetHub {
 
       const conversations = [];
       for (const [roomId, roomObj] of this.rooms.entries()) {
-        if (roomId === GLOBAL_ROOM_ID || roomObj.created_at < cutoff) continue;
+        const lastActive = roomObj.updated_at || roomObj.created_at;
+        if (roomId === GLOBAL_ROOM_ID || lastActive < cutoff) continue;
         if (!roomId.startsWith(`${myId}__`) && !roomId.endsWith(`__${myId}`)) continue;
 
         const createdAt = Number(roomObj.created_at);
@@ -798,19 +810,30 @@ export class WhisperNetHub {
     const roomMsgsMatch = pathname.match(/^\/api\/rooms\/([^/]+)\/messages$/);
     if (roomMsgsMatch && request.method === 'GET') {
       const roomId = decodeURIComponent(roomMsgsMatch[1]);
-      const cutoff = Date.now() - TTL_MS;
-      const roomObj = this.rooms.get(roomId);
-
-      if (!roomObj || (roomId !== GLOBAL_ROOM_ID && roomObj.created_at < cutoff)) {
-        return jsonResponse(
-          { ok: true, roomExists: false, messages: [] },
-          200,
-          request,
-          this.env
-        );
+      const now = Date.now();
+      const cutoff = now - TTL_MS;
+      const requesterId = normalizeCode(url.searchParams.get('myId') || '');
+      if (requesterId && /^USER-[A-Z0-9]{4,8}$/.test(requesterId)) {
+        this.registerIdentity(requesterId);
       }
 
-      const requesterId = normalizeCode(url.searchParams.get('myId') || '');
+      let roomObj = this.rooms.get(roomId);
+      if (!roomObj || (roomId !== GLOBAL_ROOM_ID && (roomObj.updated_at || roomObj.created_at) < cutoff)) {
+        if (this.nukedRooms.has(roomId)) {
+          return jsonResponse(
+            { ok: true, roomExists: false, nuked: true, messages: [] },
+            200,
+            request,
+            this.env
+          );
+        }
+        roomObj = { room_id: roomId, created_at: now, updated_at: now };
+        this.rooms.set(roomId, roomObj);
+        if (!this.messages.has(roomId)) {
+          this.messages.set(roomId, []);
+        }
+      }
+
       const peerId = requesterId ? extractPeerFromRoomId(roomId, requesterId) : null;
       const peerAlive = peerId ? this.doesUserExistOrOnline(peerId) : true;
 
@@ -862,8 +885,12 @@ export class WhisperNetHub {
       const recipientId = extractPeerFromRoomId(roomId, senderId);
 
       this.registerIdentity(senderId);
-      if (!this.rooms.has(roomId)) {
-        this.rooms.set(roomId, { room_id: roomId, created_at: now });
+      this.nukedRooms.delete(roomId);
+      const existingRoom = this.rooms.get(roomId);
+      if (!existingRoom) {
+        this.rooms.set(roomId, { room_id: roomId, created_at: now, updated_at: now });
+      } else {
+        existingRoom.updated_at = now;
       }
       const roomList = this.messages.get(roomId) || [];
       const exists = roomList.some((m) => m.id === messageId);
@@ -1003,6 +1030,7 @@ export class WhisperNetHub {
       }
       this.messages.delete(roomId);
       this.rooms.delete(roomId);
+      this.nukedRooms.set(roomId, Date.now());
 
       // Execute Hard Wiping Protocol (`await state.storage.deleteAll()`) to purge all storage fragments
       await this.executeHardStorageWipe();

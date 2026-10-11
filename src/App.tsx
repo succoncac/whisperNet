@@ -104,8 +104,8 @@ const BROADCAST_CHANNEL_NAME = 'whispernet_zero_trace_multitab_sync_v1';
 
 // 1-Hour Ephemeral TTL for all messages, rooms, and user identities
 const TTL_MS = 60 * 60 * 1000;
-// Prolonged Inactivity Idle Timeout (15 minutes) triggers automatic local wipe & disconnect
-const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+// Prolonged Inactivity Idle Timeout matched to 1-Hour TTL so active users never lose chats prematurely
+const IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 
 const SESSION_IDENTITY_KEY = 'whispernet_immutable_session_id_v1';
 const SESSION_IDENTITY_META_KEY = 'whispernet_identity_meta_v1';
@@ -1038,13 +1038,12 @@ export default function App() {
       // Check for prolonged user inactivity (Idle Auto-Wipe after 15m)
       const isIdleExpired = now - lastActivityRef.current >= IDLE_TIMEOUT_MS;
 
-      // Detect if user cleared cookies / localStorage / sessionStorage or if 1-hour TTL expired
+      // Only rotate identity and wipe chat when the full 1-hour TTL has genuinely expired
       let storageCleared = false;
       try {
-        const storedId =
-          localStorage.getItem(SESSION_IDENTITY_KEY) ||
-          sessionStorage.getItem(SESSION_IDENTITY_KEY);
-        if (!storedId || storedId !== myId) {
+        const storedLocal = localStorage.getItem(SESSION_IDENTITY_KEY);
+        const storedSession = sessionStorage.getItem(SESSION_IDENTITY_KEY);
+        if (!storedLocal && !storedSession) {
           storageCleared = true;
         }
       } catch {
@@ -1515,11 +1514,8 @@ export default function App() {
             }
           }
 
-          // 4. Stale Session / Partner Disconnected or Left Event ("Ghost Chat" Fix)
-          else if (
-            (payload.type === 'USER_DISCONNECTED' || payload.type === 'USER_LEFT') &&
-            payload.userId
-          ) {
+          // 4. Stale Session / Partner Explicitly Left Event (Do NOT lock/delete chat on transient WS drop)
+          else if (payload.type === 'USER_LEFT' && payload.userId) {
             const departedUser = String(payload.userId);
             setDisconnectedPeersMap((prev) => ({ ...prev, [departedUser]: true }));
             setConversations((prev) =>
@@ -1534,6 +1530,13 @@ export default function App() {
               setPeerTyping(false);
               setPeerDisconnected(true);
               setPickerOpenFor(null);
+            }
+            fetchConversations();
+          } else if (payload.type === 'USER_DISCONNECTED' && payload.userId) {
+            const offlineUser = String(payload.userId);
+            if (offlineUser === activePeerIdRef.current) {
+              setPeerOnline(false);
+              setPeerTyping(false);
             }
             fetchConversations();
           }
@@ -1832,15 +1835,18 @@ export default function App() {
           if (!data.ok) return;
 
           if (data.roomExists === false) {
-            closeWebRtcChannel();
-            setPrivateMessages([]);
-            setActiveRoom(null);
-            setActivePeerId(null);
-            setPeerDisconnected(false);
-            setNukeAlert(
-              'CHANNEL TERMINATED: Private room and all messages were permanently purged.'
-            );
-            fetchConversations();
+            // Only close the chat if it was explicitly nuked; otherwise keep existing messages intact while user is still active
+            if (data.nuked === true) {
+              closeWebRtcChannel();
+              setPrivateMessages([]);
+              setActiveRoom(null);
+              setActivePeerId(null);
+              setPeerDisconnected(false);
+              setNukeAlert(
+                'CHANNEL TERMINATED: Private room and all messages were permanently purged.'
+              );
+              fetchConversations();
+            }
             return;
           }
 
