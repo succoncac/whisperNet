@@ -1,0 +1,6 @@
+{
+  "name": "WhisperNet",
+  "description": "Ultra-sleek 1-on-1 private and global zero-trace chat web application with 24-hour auto-deletion and instant bilateral nuke protocol.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

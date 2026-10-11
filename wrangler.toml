@@ -1,0 +1,24 @@
+name = "whispernet-zero-trace"
+main = "cloudflare-worker.js"
+compatibility_date = "2025-02-01"
+workers_dev = true
+
+# Serve the built React + Tailwind SPA from ./dist alongside the Worker API & WebSocket
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+
+# Bind the Durable Object for real-time WebSocket signaling and zero-trace state
+[durable_objects]
+bindings = [
+  { name = "WHISPERNET_HUB", class_name = "WhisperNetHub" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WhisperNetHub"]
+
+# Optional: Custom Domain Routing on Cloudflare
+# [[routes]]
+# pattern = "chat.yourdomain.com"
+# custom_domain = true
