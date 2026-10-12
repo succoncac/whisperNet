@@ -31,6 +31,7 @@ import {
   parseUrlHashContext,
   hasPrivateUrlHashRoute,
   bootstrapRoomUrlHashSecret,
+  getFullRoomInviteUrl,
   encryptMessageContent,
   decryptMessageContent,
 } from './crypto';
@@ -524,6 +525,7 @@ export default function App() {
   const [isNuking, setIsNuking] = useState<boolean>(false);
   const [showNukeModal, setShowNukeModal] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<boolean>(false);
+  const [copiedInviteLink, setCopiedInviteLink] = useState<boolean>(false);
   const [missingUrlHashKey, setMissingUrlHashKey] = useState<boolean>(() => {
     try {
       return Boolean(parseUrlHashContext().hasMalformedOrMissingKeyInHash);
@@ -1323,8 +1325,28 @@ export default function App() {
       return false;
     };
 
-    const onHashChange = () => {
+    const onHashChange = async () => {
       handleHashRouteAndValidation(true);
+      const currentRoomId = activeRoomIdRef.current;
+      const currentPeerId = activePeerIdRef.current;
+      if (currentRoomId) {
+        try {
+          const res = await fetch(
+            `/api/rooms/${encodeURIComponent(currentRoomId)}/messages?myId=${encodeURIComponent(myId)}`
+          );
+          const data = await res.json();
+          if (data?.ok && Array.isArray(data.messages)) {
+            const decrypted = await decryptMessageBatch(
+              data.messages,
+              currentRoomId,
+              currentPeerId || undefined
+            );
+            setPrivateMessages(decrypted);
+          }
+        } catch {
+          // ignore
+        }
+      }
     };
 
     const onDomContentLoaded = () => {
@@ -2435,6 +2457,14 @@ export default function App() {
     setTimeout(() => setCopiedId(false), 1800);
   };
 
+  const copyRoomInviteLink = () => {
+    if (!activeRoom || !activePeerId) return;
+    const fullInviteUrl = getFullRoomInviteUrl(activeRoom.room_id, activePeerId, myId);
+    navigator.clipboard.writeText(fullInviteUrl);
+    setCopiedInviteLink(true);
+    setTimeout(() => setCopiedInviteLink(false), 1800);
+  };
+
   const totalUnreadCount: number = (Object.values(unreadByPeer) as number[]).reduce(
     (acc, count) => acc + count,
     0
@@ -3114,9 +3144,23 @@ export default function App() {
             </div>
           </div>
 
-          {/* Alert Banners for Nuke or Invalid User ID Validation */}
-          {(nukeAlert || errorBanner) && (
+          {/* Alert Banners for Missing URL Hash Key, Nuke, or Invalid User ID Validation */}
+          {(missingUrlHashKey || nukeAlert || errorBanner) && (
             <div className="shrink-0 px-3 sm:px-6 pt-2.5 space-y-2 w-full max-w-full">
+              {missingUrlHashKey && (
+                <div
+                  role="alert"
+                  className="p-2.5 sm:p-3 bg-amber-950/80 border border-amber-600/90 rounded-lg flex items-center justify-between gap-2 text-xs text-amber-200"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span className="font-medium break-words">
+                      Missing encryption key in URL. Please use the complete invite link.
+                    </span>
+                  </div>
+                </div>
+              )}
+
               {nukeAlert && (
                 <div className="p-2.5 sm:p-3 bg-rose-950/50 border border-rose-800/80 rounded-lg flex items-center justify-between gap-2 text-xs text-rose-200">
                   <div className="flex items-center gap-2 min-w-0">
@@ -3441,6 +3485,24 @@ export default function App() {
                     </div>
 
                     <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={copyRoomInviteLink}
+                        className="px-2.5 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-200 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                        title="Copy full encrypted invite link (#peer=...&key=...)"
+                      >
+                        {copiedInviteLink ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <span className="text-emerald-400">Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <span>Copy Link</span>
+                          </>
+                        )}
+                      </button>
                       <button
                         type="button"
                         onClick={() => {
