@@ -102,7 +102,7 @@ const EMBEDDED_HTML = `<!doctype html>
 <html lang="en" class="dark h-dvh w-full max-w-full overflow-hidden">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>ㅤ</title>
   <meta name="description" content="ㅤ" />
   <meta property="og:title" content="ㅤ" />
@@ -127,7 +127,7 @@ const EMBEDDED_HTML = `<!doctype html>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="fixed inset-0 w-full h-full overflow-hidden bg-zinc-950 text-zinc-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
-  <div id="app-shell" class="fixed inset-x-0 top-0 h-dvh w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950">
+  <div id="app-shell" class="fixed inset-x-0 top-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950">
     <div id="messages" class="flex-1 min-h-0 w-full max-w-4xl overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-5 space-y-2"></div>
     <div class="shrink-0 w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] z-20">
       <form id="composer" class="w-full max-w-4xl px-2.5 pt-2.5 pb-1 sm:px-6 sm:py-3 flex items-end gap-2">
@@ -152,11 +152,17 @@ const EMBEDDED_HTML = `<!doctype html>
     let activeWs = null;
 
     function syncViewport() {
+      if (window.scrollY !== 0 || window.scrollX !== 0) {
+        window.scrollTo(0, 0);
+      }
+      const docH = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight;
+      const winH = window.innerHeight || docH;
       if (window.visualViewport) {
-        appShell.style.height = Math.round(window.visualViewport.height) + 'px';
-        appShell.style.top = Math.round(window.visualViewport.offsetTop) + 'px';
+        const rawH = window.visualViewport.height > 0 ? Math.min(window.visualViewport.height, winH) : winH;
+        appShell.style.height = Math.max(180, Math.round(rawH)) + 'px';
+        appShell.style.top = Math.max(0, Math.round(window.visualViewport.offsetTop)) + 'px';
       } else {
-        appShell.style.height = window.innerHeight + 'px';
+        appShell.style.height = Math.max(180, Math.round(winH)) + 'px';
         appShell.style.top = '0px';
       }
       if (isNearBottom) {
@@ -164,12 +170,17 @@ const EMBEDDED_HTML = `<!doctype html>
       }
     }
     syncViewport();
+    [50, 150, 300, 600, 1000].forEach(ms => setTimeout(syncViewport, ms));
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', syncViewport);
       window.visualViewport.addEventListener('scroll', syncViewport);
     }
     window.addEventListener('resize', syncViewport);
     window.addEventListener('orientationchange', syncViewport);
+    window.addEventListener('pageshow', syncViewport);
+    window.addEventListener('focus', syncViewport);
+    document.addEventListener('focusin', syncViewport);
+    document.addEventListener('focusout', syncViewport);
 
     messagesEl.addEventListener('scroll', () => {
       const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;

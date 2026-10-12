@@ -104,23 +104,52 @@ export default function App() {
     isNearBottomRef.current = distanceFromBottom <= 120;
   }, []);
 
-  // Adapt dynamically to mobile browser bottom bars & virtual keyboards (iOS Safari / Android Chrome / In-App Browsers)
+  // Adapt dynamically to mobile browser bottom bars & virtual keyboards (including when entering URL with keyboard already open)
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
     const updateViewportBounds = () => {
+      // Prevent browser from scrolling the document out of view when keyboard transitions during navigation
+      if (window.scrollY !== 0 || window.scrollX !== 0) {
+        window.scrollTo(0, 0);
+      }
+
       const vv = window.visualViewport;
+      const docHeight = document.documentElement?.clientHeight || window.innerHeight;
+      const winHeight = window.innerHeight || docHeight;
+
       if (vv) {
-        setViewportStyle({
-          height: `${Math.round(vv.height)}px`,
-          top: `${Math.round(vv.offsetTop)}px`,
+        // When navigating from URL bar with keyboard open, vv.height or winHeight may settle asynchronously
+        const rawHeight = vv.height > 0 ? Math.min(vv.height, winHeight) : winHeight;
+        const safeHeight = Math.max(180, Math.round(rawHeight));
+        const safeTop = Math.max(0, Math.round(vv.offsetTop));
+
+        setViewportStyle((prev) => {
+          const nextH = `${safeHeight}px`;
+          const nextT = `${safeTop}px`;
+          if (prev.height === nextH && prev.top === nextT) return prev;
+          return {
+            position: 'fixed',
+            top: nextT,
+            left: '0px',
+            right: '0px',
+            height: nextH,
+          };
         });
       } else {
-        setViewportStyle({
-          height: `${window.innerHeight}px`,
-          top: '0px',
+        const fallbackH = `${Math.max(180, Math.round(winHeight))}px`;
+        setViewportStyle((prev) => {
+          if (prev.height === fallbackH && prev.top === '0px') return prev;
+          return {
+            position: 'fixed',
+            top: '0px',
+            left: '0px',
+            right: '0px',
+            height: fallbackH,
+          };
         });
       }
+
       if (isNearBottomRef.current) {
         requestAnimationFrame(() => {
           scrollToBottomInstant();
@@ -130,6 +159,10 @@ export default function App() {
 
     updateViewportBounds();
 
+    // Multi-stage sync during initial navigation so keyboard dismiss/keep-open transitions after URL bar Enter are always caught
+    const syncDelays = [50, 150, 300, 600, 1000];
+    const timers = syncDelays.map((ms) => window.setTimeout(updateViewportBounds, ms));
+
     const vv = window.visualViewport;
     if (vv) {
       vv.addEventListener('resize', updateViewportBounds);
@@ -137,14 +170,23 @@ export default function App() {
     }
     window.addEventListener('resize', updateViewportBounds);
     window.addEventListener('orientationchange', updateViewportBounds);
+    window.addEventListener('pageshow', updateViewportBounds);
+    window.addEventListener('focus', updateViewportBounds);
+    document.addEventListener('focusin', updateViewportBounds);
+    document.addEventListener('focusout', updateViewportBounds);
 
     return () => {
+      timers.forEach((t) => window.clearTimeout(t));
       if (vv) {
         vv.removeEventListener('resize', updateViewportBounds);
         vv.removeEventListener('scroll', updateViewportBounds);
       }
       window.removeEventListener('resize', updateViewportBounds);
       window.removeEventListener('orientationchange', updateViewportBounds);
+      window.removeEventListener('pageshow', updateViewportBounds);
+      window.removeEventListener('focus', updateViewportBounds);
+      document.removeEventListener('focusin', updateViewportBounds);
+      document.removeEventListener('focusout', updateViewportBounds);
     };
   }, [scrollToBottomInstant]);
 
