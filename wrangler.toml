@@ -6,12 +6,12 @@ workers_dev = true
 [vars]
 ALLOWED_ORIGINS = "*"
 
-# Serve the built React + Tailwind SPA from ./dist alongside the Worker API & WebSocket
+# Serve the built SPA from ./dist alongside the Worker API & WebSocket
 [assets]
 directory = "./dist"
 not_found_handling = "single-page-application"
 
-# Bind the Durable Object for real-time WebSocket signaling, WebRTC P2P negotiation, and pure in-memory RAM state
+# Bind the Durable Object for real-time WebSocket broadcast and 30-minute auto-purging storage
 [durable_objects]
 bindings = [
   { name = "WHISPERNET_HUB", class_name = "WhisperNetHub" }
@@ -21,7 +21,3 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["WhisperNetHub"]
 
-# Optional: Custom Domain Routing on Cloudflare
-# [[routes]]
-# pattern = "chat.yourdomain.com"
-# custom_domain = true
