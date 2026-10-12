@@ -131,9 +131,6 @@ const EMBEDDED_HTML = `<!doctype html>
     <div id="messages" class="flex-1 min-h-0 w-full max-w-4xl overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-5 space-y-2"></div>
     <div class="shrink-0 w-full border-t border-zinc-900/90 bg-zinc-950/95 backdrop-blur-md flex justify-center pb-[env(safe-area-inset-bottom)]">
       <form id="composer" class="w-full max-w-4xl px-2.5 py-2.5 sm:px-6 sm:py-3.5 flex items-end gap-2">
-        <button id="pwa-install-btn" type="button" title="Install PWA" aria-label="Install App" class="hidden h-[42px] sm:h-[40px] w-[42px] sm:w-[40px] items-center justify-center bg-zinc-900 hover:bg-zinc-800 active:scale-[0.98] border border-zinc-800 text-zinc-300 hover:text-zinc-100 rounded-xl transition-all shrink-0 cursor-pointer select-none">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-        </button>
         <textarea id="input" rows="1" maxlength="2000" placeholder="Write a message..." class="min-w-0 flex-1 max-h-36 resize-none overflow-y-auto px-3.5 py-2.5 text-base sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-800 rounded-xl text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-zinc-700"></textarea>
         <button type="submit" class="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-medium bg-zinc-100 hover:bg-white active:scale-[0.98] text-zinc-950 rounded-xl transition-all shrink-0 cursor-pointer select-none">Send</button>
       </form>
@@ -144,24 +141,6 @@ const EMBEDDED_HTML = `<!doctype html>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});
     }
-
-    let deferredPrompt = null;
-    const installBtn = document.getElementById('pwa-install-btn');
-    window.addEventListener('beforeinstallprompt', (e) => {
-      e.preventDefault();
-      deferredPrompt = e;
-      installBtn.classList.remove('hidden');
-      installBtn.classList.add('flex');
-    });
-    installBtn.addEventListener('click', async () => {
-      if (!deferredPrompt) return;
-      deferredPrompt.prompt();
-      const { outcome } = await deferredPrompt.userChoice;
-      if (outcome === 'accepted') {
-        deferredPrompt = null;
-        installBtn.classList.add('hidden');
-      }
-    });
 
     const TTL_MS = 30 * 60 * 1000;
     const appShell = document.getElementById('app-shell');

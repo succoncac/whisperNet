@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
-import { PWAInstallButton } from './PWAInstallButton';
 
 // Strict 30-Minute Ephemeral Message Lifetime (1,800,000 ms)
 const TTL_MS = 30 * 60 * 1000;
@@ -499,13 +498,12 @@ export default function App() {
         ))}
       </div>
 
-      {/* Minimal Bottom Composer + PWA Install Trigger */}
+      {/* Minimal Bottom Composer */}
       <div className="shrink-0 w-full border-t border-zinc-900/90 bg-zinc-950/95 backdrop-blur-md flex justify-center pb-[env(safe-area-inset-bottom)]">
         <form
           onSubmit={handleSubmit}
           className="w-full max-w-4xl px-2.5 py-2.5 sm:px-6 sm:py-3.5 flex items-end gap-2"
         >
-          <PWAInstallButton />
           <textarea
             ref={inputRef}
             rows={1}
