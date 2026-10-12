@@ -102,18 +102,38 @@ async function startServer() {
 
   app.use(express.json({ limit: '64kb' }));
 
+  // Ensure malformed JSON body requests always return strict JSON instead of default Express HTML error
+  app.use(
+    (
+      err: Error & { status?: number; type?: string },
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (err && (err instanceof SyntaxError || err.type === 'entity.parse.failed')) {
+        res.status(400).json({ ok: false, error: 'Invalid JSON payload.' });
+        return;
+      }
+      next(err);
+    }
+  );
+
   const clients = new Set<WebSocket>();
 
-  function broadcast(payload: Record<string, unknown>) {
+  function broadcast(payload: Record<string, unknown>, excludeClient?: WebSocket) {
     const serialized = JSON.stringify(payload);
     for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
+      if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
         client.send(serialized);
       }
     }
   }
 
-  function appendMessage(rawContent: string, rawClientId?: string): EphemeralMessage | null {
+  function appendMessage(
+    rawContent: string,
+    rawClientId?: string,
+    senderWs?: WebSocket
+  ): EphemeralMessage | null {
     purgeExpiredMessages();
     const content = String(rawContent || '').trim();
     if (!content) return null;
@@ -139,12 +159,15 @@ async function startServer() {
       memoryMessages = memoryMessages.slice(-MAX_MESSAGES_IN_RAM);
     }
 
-    // Immediate broadcast to all connected WebSocket clients
-    broadcast({
-      type: 'message:created',
-      message: record,
-      ttlMs: TTL_MS,
-    });
+    // Immediate broadcast to all other connected WebSocket clients (sender receives single message:ack)
+    broadcast(
+      {
+        type: 'message:created',
+        message: record,
+        ttlMs: TTL_MS,
+      },
+      senderWs
+    );
 
     return record;
   }
@@ -185,7 +208,8 @@ async function startServer() {
         } else if (data.type === 'message:send' && data.content) {
           const record = appendMessage(
             String(data.content),
-            data.id ? String(data.id) : undefined
+            data.id ? String(data.id) : undefined,
+            ws
           );
           if (record && ws.readyState === WebSocket.OPEN) {
             ws.send(

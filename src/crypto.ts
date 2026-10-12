@@ -610,9 +610,9 @@ export async function decryptMessageContent(
       try {
         const candidateKey = await getRoomAesGcmKey(roomId, candidateMode, cleanPeer);
         const decryptedBuffer = await window.crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv },
+          { name: 'AES-GCM', iv: iv as BufferSource },
           candidateKey,
-          cipherBytes
+          cipherBytes as BufferSource
         );
         const decoded = new TextDecoder().decode(decryptedBuffer);
         if (decryptedPayloadCache.size > 600) {

@@ -99,7 +99,7 @@ function jsonResponse(data, status = 200, request = null, env = null) {
 
 // Embedded Self-Contained Single-File HTML/Tailwind/JS Frontend (Fallback if ASSETS binding is not used)
 const EMBEDDED_HTML = `<!doctype html>
-<html lang="en" class="dark h-dvh w-full max-w-full overflow-hidden">
+<html lang="en" class="dark w-full h-full overflow-hidden">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -126,13 +126,13 @@ const EMBEDDED_HTML = `<!doctype html>
   </script>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="fixed inset-0 w-full h-full overflow-hidden bg-zinc-950 text-zinc-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
-  <div id="app-shell" class="fixed inset-x-0 top-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950">
+<body class="w-full h-full m-0 p-0 overflow-hidden bg-zinc-950 text-zinc-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
+  <div id="app-shell" class="fixed inset-x-0 top-0 bottom-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950">
     <div id="messages" class="flex-1 min-h-0 w-full max-w-4xl overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-5 space-y-2"></div>
-    <div class="shrink-0 w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] z-20">
+    <div class="shrink-0 min-h-[58px] w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] relative z-30">
       <form id="composer" class="w-full max-w-4xl px-2.5 pt-2.5 pb-1 sm:px-6 sm:py-3 flex items-end gap-2">
         <textarea id="input" rows="1" maxlength="2000" placeholder="Write a message..." class="min-w-0 flex-1 max-h-36 resize-none overflow-y-auto px-3.5 py-2.5 text-base sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-700/90 rounded-xl text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:border-zinc-500"></textarea>
-        <button type="submit" class="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-semibold bg-zinc-100 hover:bg-white active:scale-[0.98] text-zinc-950 rounded-xl transition-all shrink-0 cursor-pointer select-none">Send</button>
+        <button id="send-btn" type="submit" class="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-semibold bg-zinc-100 hover:bg-white active:scale-[0.98] text-zinc-950 rounded-xl transition-all shrink-0 cursor-pointer select-none">Send</button>
       </form>
     </div>
   </div>
@@ -147,33 +147,35 @@ const EMBEDDED_HTML = `<!doctype html>
     const messagesEl = document.getElementById('messages');
     const formEl = document.getElementById('composer');
     const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send-btn');
     let messages = [];
     let isNearBottom = true;
     let activeWs = null;
+
+    sendBtn.addEventListener('mousedown', (e) => e.preventDefault());
 
     function syncViewport() {
       if (window.scrollY !== 0 || window.scrollX !== 0) {
         window.scrollTo(0, 0);
       }
-      const docH = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight;
-      const winH = window.innerHeight || docH;
-      if (window.visualViewport) {
-        const rawH = window.visualViewport.height > 0 ? Math.min(window.visualViewport.height, winH) : winH;
-        appShell.style.height = Math.max(180, Math.round(rawH)) + 'px';
-        appShell.style.top = Math.max(0, Math.round(window.visualViewport.offsetTop)) + 'px';
-      } else {
-        appShell.style.height = Math.max(180, Math.round(winH)) + 'px';
-        appShell.style.top = '0px';
-      }
+      const fallbackH = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 600;
+      const vv = window.visualViewport;
+      const rawH = vv && vv.height > 0 ? vv.height : fallbackH;
+      appShell.style.height = Math.max(160, Math.round(rawH)) + 'px';
+      appShell.style.top = (vv ? Math.max(0, Math.round(vv.offsetTop)) : 0) + 'px';
+      appShell.style.bottom = 'auto';
       if (isNearBottom) {
         messagesEl.scrollTop = messagesEl.scrollHeight;
       }
     }
     syncViewport();
-    [50, 150, 300, 600, 1000].forEach(ms => setTimeout(syncViewport, ms));
+    [30, 100, 250, 500, 900, 1500].forEach(ms => setTimeout(syncViewport, ms));
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', syncViewport);
       window.visualViewport.addEventListener('scroll', syncViewport);
+    }
+    if (typeof ResizeObserver !== 'undefined' && document.documentElement) {
+      new ResizeObserver(syncViewport).observe(document.documentElement);
     }
     window.addEventListener('resize', syncViewport);
     window.addEventListener('orientationchange', syncViewport);
@@ -377,9 +379,10 @@ export class WhisperNetHub {
     }
   }
 
-  broadcast(payload) {
+  broadcast(payload, excludeWs = null) {
     const serialized = JSON.stringify(payload);
     for (const ws of this.clients) {
+      if (ws === excludeWs) continue;
       try {
         ws.send(serialized);
       } catch {
@@ -389,7 +392,7 @@ export class WhisperNetHub {
   }
 
   // Zero-Latency Append: Broadcasts to all connected sockets BEFORE disk storage write completes
-  appendMessageFast(rawContent, rawClientId) {
+  appendMessageFast(rawContent, rawClientId, senderWs = null) {
     this.purgeExpiredMessagesInMemory();
     const content = String(rawContent || '').trim();
     if (!content) return null;
@@ -415,12 +418,15 @@ export class WhisperNetHub {
       this.messages = this.messages.slice(-MAX_MESSAGES_IN_RAM);
     }
 
-    // 1. Broadcast IMMEDIATELY in-memory to all connected peers (0ms I/O wait)
-    this.broadcast({
-      type: 'message:created',
-      message: record,
-      ttlMs: TTL_MS,
-    });
+    // 1. Broadcast IMMEDIATELY in-memory to all other connected peers (0ms I/O wait)
+    this.broadcast(
+      {
+        type: 'message:created',
+        message: record,
+        ttlMs: TTL_MS,
+      },
+      senderWs
+    );
 
     // 2. Persist to Durable Object disk & schedule TTL alarm asynchronously in background
     this.persistAndScheduleAsync();
@@ -457,7 +463,7 @@ export class WhisperNetHub {
         if (data.type === 'ping') {
           server.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
         } else if (data.type === 'message:send' && data.content) {
-          const record = this.appendMessageFast(data.content, data.id);
+          const record = this.appendMessageFast(data.content, data.id, server);
           if (record) {
             server.send(
               JSON.stringify({

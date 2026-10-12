@@ -109,46 +109,32 @@ export default function App() {
     if (typeof window === 'undefined') return;
 
     const updateViewportBounds = () => {
-      // Prevent browser from scrolling the document out of view when keyboard transitions during navigation
       if (window.scrollY !== 0 || window.scrollX !== 0) {
         window.scrollTo(0, 0);
       }
 
       const vv = window.visualViewport;
-      const docHeight = document.documentElement?.clientHeight || window.innerHeight;
-      const winHeight = window.innerHeight || docHeight;
+      const fallbackHeight =
+        window.innerHeight || document.documentElement?.clientHeight || 600;
 
-      if (vv) {
-        // When navigating from URL bar with keyboard open, vv.height or winHeight may settle asynchronously
-        const rawHeight = vv.height > 0 ? Math.min(vv.height, winHeight) : winHeight;
-        const safeHeight = Math.max(180, Math.round(rawHeight));
-        const safeTop = Math.max(0, Math.round(vv.offsetTop));
+      // Trust visualViewport.height directly when available (do NOT clamp with stale window.innerHeight)
+      const rawHeight = vv && vv.height > 0 ? vv.height : fallbackHeight;
+      const safeHeight = Math.max(160, Math.round(rawHeight));
+      const safeTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
 
-        setViewportStyle((prev) => {
-          const nextH = `${safeHeight}px`;
-          const nextT = `${safeTop}px`;
-          if (prev.height === nextH && prev.top === nextT) return prev;
-          return {
-            position: 'fixed',
-            top: nextT,
-            left: '0px',
-            right: '0px',
-            height: nextH,
-          };
-        });
-      } else {
-        const fallbackH = `${Math.max(180, Math.round(winHeight))}px`;
-        setViewportStyle((prev) => {
-          if (prev.height === fallbackH && prev.top === '0px') return prev;
-          return {
-            position: 'fixed',
-            top: '0px',
-            left: '0px',
-            right: '0px',
-            height: fallbackH,
-          };
-        });
-      }
+      setViewportStyle((prev) => {
+        const nextH = `${safeHeight}px`;
+        const nextT = `${safeTop}px`;
+        if (prev.height === nextH && prev.top === nextT) return prev;
+        return {
+          position: 'fixed',
+          top: nextT,
+          left: '0px',
+          right: '0px',
+          bottom: 'auto',
+          height: nextH,
+        };
+      });
 
       if (isNearBottomRef.current) {
         requestAnimationFrame(() => {
@@ -160,7 +146,7 @@ export default function App() {
     updateViewportBounds();
 
     // Multi-stage sync during initial navigation so keyboard dismiss/keep-open transitions after URL bar Enter are always caught
-    const syncDelays = [50, 150, 300, 600, 1000];
+    const syncDelays = [30, 100, 250, 500, 900, 1500];
     const timers = syncDelays.map((ms) => window.setTimeout(updateViewportBounds, ms));
 
     const vv = window.visualViewport;
@@ -168,6 +154,13 @@ export default function App() {
       vv.addEventListener('resize', updateViewportBounds);
       vv.addEventListener('scroll', updateViewportBounds);
     }
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && document.documentElement) {
+      resizeObserver = new ResizeObserver(updateViewportBounds);
+      resizeObserver.observe(document.documentElement);
+    }
+
     window.addEventListener('resize', updateViewportBounds);
     window.addEventListener('orientationchange', updateViewportBounds);
     window.addEventListener('pageshow', updateViewportBounds);
@@ -180,6 +173,9 @@ export default function App() {
       if (vv) {
         vv.removeEventListener('resize', updateViewportBounds);
         vv.removeEventListener('scroll', updateViewportBounds);
+      }
+      if (resizeObserver) {
+        resizeObserver.disconnect();
       }
       window.removeEventListener('resize', updateViewportBounds);
       window.removeEventListener('orientationchange', updateViewportBounds);
@@ -439,8 +435,9 @@ export default function App() {
   useEffect(() => {
     const interval = window.setInterval(() => {
       const now = Date.now();
-      setNowTick(now);
       setMessages((prev) => {
+        if (prev.length === 0) return prev;
+        setNowTick(now);
         const cutoff = now - TTL_MS;
         const hasExpired = prev.some((m) => m.timestamp < cutoff);
         if (!hasExpired) return prev;
@@ -486,6 +483,7 @@ export default function App() {
       };
 
       isNearBottomRef.current = true;
+      setNowTick(now);
       setMessages((prev) => filterValidMessages([...prev, optimisticMsg], now));
       broadcastChannelRef.current?.postMessage({
         type: 'message:created',
@@ -549,7 +547,7 @@ export default function App() {
   return (
     <div
       style={viewportStyle}
-      className="fixed inset-x-0 top-0 h-dvh w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text"
+      className="fixed inset-x-0 top-0 bottom-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text"
     >
       {/* Single Shared Public Message Stream (Responsive across Mobile, Tablet, Desktop, Ultrawide) */}
       <div
@@ -563,7 +561,7 @@ export default function App() {
       </div>
 
       {/* Minimal Bottom Composer */}
-      <div className="shrink-0 w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] z-20">
+      <div className="shrink-0 min-h-[58px] w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] relative z-30">
         <form
           onSubmit={handleSubmit}
           className="w-full max-w-4xl px-2.5 pt-2.5 pb-1 sm:px-6 sm:py-3 flex items-end gap-2"
@@ -588,6 +586,7 @@ export default function App() {
           <button
             type="submit"
             disabled={!draft.trim()}
+            onMouseDown={(e) => e.preventDefault()}
             className="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-semibold bg-zinc-100 hover:bg-white active:scale-[0.98] disabled:bg-zinc-800 disabled:text-zinc-400 disabled:border disabled:border-zinc-700 text-zinc-950 rounded-xl transition-all whitespace-nowrap shrink-0 cursor-pointer select-none"
           >
             Send
