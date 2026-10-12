@@ -2,20 +2,36 @@
 <html lang="en" class="dark h-dvh w-full max-w-full overflow-hidden">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <title>WhisperNet</title>
-    <meta name="description" content="Ultra-sleek 1-on-1 private and global zero-trace chat web application with 24-hour auto-deletion and instant bilateral nuke protocol." />
-    <meta property="og:title" content="WhisperNet" />
-    <meta property="og:description" content="Ultra-sleek 1-on-1 private and global zero-trace chat web application with 24-hour auto-deletion and instant bilateral nuke protocol." />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+    <title>ㅤ</title>
+    <meta name="description" content="ㅤ" />
+    <meta property="og:title" content="ㅤ" />
+    <meta property="og:description" content="ㅤ" />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ㅤ" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <script>
+      (function () {
+        var h = window.location.hostname;
+        var isLocal = h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h.endsWith('.local');
+        if (!isLocal && window.location.protocol === 'http:') {
+          window.location.replace('https://' + window.location.host + window.location.pathname + window.location.search + window.location.hash);
+        }
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   </head>
-  <body class="h-dvh w-full max-w-full overflow-hidden bg-slate-950 text-slate-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
+  <body class="h-dvh w-full max-w-full overflow-hidden bg-zinc-950 text-zinc-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
     <div id="root" class="h-dvh w-full max-w-full overflow-hidden"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

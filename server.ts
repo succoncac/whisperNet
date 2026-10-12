@@ -36,7 +36,18 @@ async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+
+  // Disable perMessageDeflate for instant sub-millisecond WebSocket frame delivery
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    perMessageDeflate: false,
+  });
+
+  // Enable TCP_NODELAY (disable Nagle's algorithm) on all incoming connections for zero-latency packet push
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
 
   const allowedOriginsRaw = process.env.ALLOWED_ORIGINS || '*';
   const allowedOrigins = allowedOriginsRaw
@@ -44,7 +55,31 @@ async function startServer() {
     .map((o) => o.trim())
     .filter(Boolean);
 
+  // Forced HTTP -> HTTPS 301 Redirect & HSTS + CORS Middleware
   app.use((req, res, next) => {
+    const hostHeader = String(req.headers.host || '');
+    const hostname = hostHeader.split(':')[0].toLowerCase();
+    const isLocalhost =
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '[::1]' ||
+      hostname === '0.0.0.0' ||
+      hostname.endsWith('.local');
+
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+
+    if (!isLocalhost && forwardedProto === 'http') {
+      res.redirect(301, `https://${hostHeader}${req.originalUrl}`);
+      return;
+    }
+
+    if (!isLocalhost) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    }
+
     const origin = req.headers.origin;
     if (allowedOrigins.includes('*')) {
       res.setHeader('Access-Control-Allow-Origin', origin || '*');
@@ -79,6 +114,7 @@ async function startServer() {
   }
 
   function appendMessage(rawContent: string, rawClientId?: string): EphemeralMessage | null {
+    purgeExpiredMessages();
     const content = String(rawContent || '').trim();
     if (!content) return null;
     const truncated = content.slice(0, 2000);
@@ -103,6 +139,7 @@ async function startServer() {
       memoryMessages = memoryMessages.slice(-MAX_MESSAGES_IN_RAM);
     }
 
+    // Immediate broadcast to all connected WebSocket clients
     broadcast({
       type: 'message:created',
       message: record,
@@ -140,14 +177,26 @@ async function startServer() {
 
     ws.on('message', (raw) => {
       try {
-        purgeExpiredMessages();
         const data = JSON.parse(String(raw));
         if (data.type === 'ping') {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           }
         } else if (data.type === 'message:send' && data.content) {
-          appendMessage(String(data.content), data.id ? String(data.id) : undefined);
+          const record = appendMessage(
+            String(data.content),
+            data.id ? String(data.id) : undefined
+          );
+          if (record && ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: 'message:ack',
+                id: record.id,
+                message: record,
+                ttlMs: TTL_MS,
+              })
+            );
+          }
         }
       } catch {
         // Ignore malformed WS frames
@@ -177,7 +226,6 @@ async function startServer() {
   // POST /api/messages (and /api/global/messages alias)
   app.post(['/api/messages', '/api/global/messages'], (req, res) => {
     try {
-      purgeExpiredMessages();
       const content = String(req.body?.content || '').trim();
       const clientId = req.body?.id ? String(req.body.id) : undefined;
 
