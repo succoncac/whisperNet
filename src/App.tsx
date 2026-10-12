@@ -64,7 +64,7 @@ export default function App() {
   const [messages, setMessages] = useState<PublicMessage[]>([]);
   const [draft, setDraft] = useState<string>('');
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
-  const [viewportHeight, setViewportHeight] = useState<number | null>(null);
+  const [viewportStyle, setViewportStyle] = useState<React.CSSProperties>({});
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -104,13 +104,23 @@ export default function App() {
     isNearBottomRef.current = distanceFromBottom <= 120;
   }, []);
 
-  // Adapt dynamically to mobile virtual keyboards (iOS Safari / Android Chrome visualViewport)
+  // Adapt dynamically to mobile browser bottom bars & virtual keyboards (iOS Safari / Android Chrome / In-App Browsers)
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.visualViewport) return;
-    const vv = window.visualViewport;
+    if (typeof window === 'undefined') return;
 
-    const handleViewportChange = () => {
-      setViewportHeight(vv.height);
+    const updateViewportBounds = () => {
+      const vv = window.visualViewport;
+      if (vv) {
+        setViewportStyle({
+          height: `${Math.round(vv.height)}px`,
+          top: `${Math.round(vv.offsetTop)}px`,
+        });
+      } else {
+        setViewportStyle({
+          height: `${window.innerHeight}px`,
+          top: '0px',
+        });
+      }
       if (isNearBottomRef.current) {
         requestAnimationFrame(() => {
           scrollToBottomInstant();
@@ -118,11 +128,23 @@ export default function App() {
       }
     };
 
-    vv.addEventListener('resize', handleViewportChange);
-    vv.addEventListener('scroll', handleViewportChange);
+    updateViewportBounds();
+
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener('resize', updateViewportBounds);
+      vv.addEventListener('scroll', updateViewportBounds);
+    }
+    window.addEventListener('resize', updateViewportBounds);
+    window.addEventListener('orientationchange', updateViewportBounds);
+
     return () => {
-      vv.removeEventListener('resize', handleViewportChange);
-      vv.removeEventListener('scroll', handleViewportChange);
+      if (vv) {
+        vv.removeEventListener('resize', updateViewportBounds);
+        vv.removeEventListener('scroll', updateViewportBounds);
+      }
+      window.removeEventListener('resize', updateViewportBounds);
+      window.removeEventListener('orientationchange', updateViewportBounds);
     };
   }, [scrollToBottomInstant]);
 
@@ -484,8 +506,8 @@ export default function App() {
 
   return (
     <div
-      style={viewportHeight ? { height: `${viewportHeight}px` } : undefined}
-      className="h-dvh w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text"
+      style={viewportStyle}
+      className="fixed inset-x-0 top-0 h-dvh w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text"
     >
       {/* Single Shared Public Message Stream (Responsive across Mobile, Tablet, Desktop, Ultrawide) */}
       <div
@@ -499,10 +521,10 @@ export default function App() {
       </div>
 
       {/* Minimal Bottom Composer */}
-      <div className="shrink-0 w-full border-t border-zinc-900/90 bg-zinc-950/95 backdrop-blur-md flex justify-center pb-[env(safe-area-inset-bottom)]">
+      <div className="shrink-0 w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] z-20">
         <form
           onSubmit={handleSubmit}
-          className="w-full max-w-4xl px-2.5 py-2.5 sm:px-6 sm:py-3.5 flex items-end gap-2"
+          className="w-full max-w-4xl px-2.5 pt-2.5 pb-1 sm:px-6 sm:py-3 flex items-end gap-2"
         >
           <textarea
             ref={inputRef}
@@ -519,12 +541,12 @@ export default function App() {
             maxLength={2000}
             autoComplete="off"
             enterKeyHint="send"
-            className="min-w-0 flex-1 max-h-36 resize-none overflow-y-auto px-3.5 py-2.5 sm:py-2 text-base sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-800 rounded-xl text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-zinc-700 transition-colors"
+            className="min-w-0 flex-1 max-h-36 resize-none overflow-y-auto px-3.5 py-2.5 sm:py-2 text-base sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-700/90 rounded-xl text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:border-zinc-500 transition-colors"
           />
           <button
             type="submit"
             disabled={!draft.trim()}
-            className="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-medium bg-zinc-100 hover:bg-white active:scale-[0.98] disabled:opacity-40 text-zinc-950 rounded-xl transition-all whitespace-nowrap shrink-0 cursor-pointer select-none"
+            className="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-semibold bg-zinc-100 hover:bg-white active:scale-[0.98] disabled:bg-zinc-800 disabled:text-zinc-400 disabled:border disabled:border-zinc-700 text-zinc-950 rounded-xl transition-all whitespace-nowrap shrink-0 cursor-pointer select-none"
           >
             Send
           </button>

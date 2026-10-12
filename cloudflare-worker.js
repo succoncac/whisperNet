@@ -126,13 +126,13 @@ const EMBEDDED_HTML = `<!doctype html>
   </script>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="h-dvh w-full max-w-full overflow-hidden bg-zinc-950 text-zinc-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
-  <div id="app-shell" class="h-dvh w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950">
+<body class="fixed inset-0 w-full h-full overflow-hidden bg-zinc-950 text-zinc-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
+  <div id="app-shell" class="fixed inset-x-0 top-0 h-dvh w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950">
     <div id="messages" class="flex-1 min-h-0 w-full max-w-4xl overflow-y-auto overflow-x-hidden px-3 py-3 sm:px-6 sm:py-5 space-y-2"></div>
-    <div class="shrink-0 w-full border-t border-zinc-900/90 bg-zinc-950/95 backdrop-blur-md flex justify-center pb-[env(safe-area-inset-bottom)]">
-      <form id="composer" class="w-full max-w-4xl px-2.5 py-2.5 sm:px-6 sm:py-3.5 flex items-end gap-2">
-        <textarea id="input" rows="1" maxlength="2000" placeholder="Write a message..." class="min-w-0 flex-1 max-h-36 resize-none overflow-y-auto px-3.5 py-2.5 text-base sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-800 rounded-xl text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-zinc-700"></textarea>
-        <button type="submit" class="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-medium bg-zinc-100 hover:bg-white active:scale-[0.98] text-zinc-950 rounded-xl transition-all shrink-0 cursor-pointer select-none">Send</button>
+    <div class="shrink-0 w-full border-t border-zinc-800/90 bg-zinc-950 flex justify-center pb-[max(0.5rem,env(safe-area-inset-bottom))] z-20">
+      <form id="composer" class="w-full max-w-4xl px-2.5 pt-2.5 pb-1 sm:px-6 sm:py-3 flex items-end gap-2">
+        <textarea id="input" rows="1" maxlength="2000" placeholder="Write a message..." class="min-w-0 flex-1 max-h-36 resize-none overflow-y-auto px-3.5 py-2.5 text-base sm:text-sm leading-relaxed bg-zinc-900 border border-zinc-700/90 rounded-xl text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:border-zinc-500"></textarea>
+        <button type="submit" class="h-[42px] sm:h-[40px] px-4 sm:px-5 text-sm font-semibold bg-zinc-100 hover:bg-white active:scale-[0.98] text-zinc-950 rounded-xl transition-all shrink-0 cursor-pointer select-none">Send</button>
       </form>
     </div>
   </div>
@@ -151,16 +151,25 @@ const EMBEDDED_HTML = `<!doctype html>
     let isNearBottom = true;
     let activeWs = null;
 
+    function syncViewport() {
+      if (window.visualViewport) {
+        appShell.style.height = Math.round(window.visualViewport.height) + 'px';
+        appShell.style.top = Math.round(window.visualViewport.offsetTop) + 'px';
+      } else {
+        appShell.style.height = window.innerHeight + 'px';
+        appShell.style.top = '0px';
+      }
+      if (isNearBottom) {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    }
+    syncViewport();
     if (window.visualViewport) {
-      const syncViewport = () => {
-        appShell.style.height = window.visualViewport.height + 'px';
-        if (isNearBottom) {
-          messagesEl.scrollTop = messagesEl.scrollHeight;
-        }
-      };
       window.visualViewport.addEventListener('resize', syncViewport);
       window.visualViewport.addEventListener('scroll', syncViewport);
     }
+    window.addEventListener('resize', syncViewport);
+    window.addEventListener('orientationchange', syncViewport);
 
     messagesEl.addEventListener('scroll', () => {
       const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
