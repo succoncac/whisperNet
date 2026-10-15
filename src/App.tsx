@@ -217,6 +217,8 @@ export default function App() {
   const [draft, setDraft] = useState<string>('');
   const [viewportStyle, setViewportStyle] = useState<React.CSSProperties>({});
   const [pendingLink, setPendingLink] = useState<string | null>(null);
+  const [showScrollBottom, setShowScrollBottom] = useState<boolean>(false);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
 
   const handleUrlClick = useCallback((url: string) => {
     setPendingLink(url);
@@ -259,6 +261,23 @@ export default function App() {
     el.scrollTop = el.scrollHeight;
   }, []);
 
+  // Smooth scroll to bottom when user clicks the floating scroll button
+  const scrollToBottomSmooth = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    isNearBottomRef.current = true;
+    setShowScrollBottom(false);
+    setUnreadCount(0);
+    try {
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: 'smooth',
+      });
+    } catch {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
+
   // Track scroll position throttled by requestAnimationFrame to prevent scroll jank
   const handleScroll = useCallback(() => {
     if (scrollRafRef.current !== null) return;
@@ -267,7 +286,13 @@ export default function App() {
       const el = scrollContainerRef.current;
       if (!el) return;
       const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      isNearBottomRef.current = distanceFromBottom <= 120;
+      const isNear = distanceFromBottom <= 120;
+      isNearBottomRef.current = isNear;
+      const shouldShow = distanceFromBottom > 160;
+      setShowScrollBottom((prev) => (prev !== shouldShow ? shouldShow : prev));
+      if (isNear) {
+        setUnreadCount((prev) => (prev !== 0 ? 0 : 0));
+      }
     });
   }, []);
 
@@ -675,13 +700,19 @@ export default function App() {
     return () => window.clearInterval(syncTimer);
   }, [fetchMessages]);
 
-  // Instant auto-scroll when new messages arrive and user is near bottom
+  // Auto-scroll when new messages arrive or track unread count when scrolled up
   const prevLenRef = useRef<number>(0);
   useEffect(() => {
-    if (messages.length > prevLenRef.current && isNearBottomRef.current) {
-      requestAnimationFrame(() => {
-        scrollToBottomInstant();
-      });
+    if (messages.length > prevLenRef.current) {
+      if (isNearBottomRef.current) {
+        requestAnimationFrame(() => {
+          scrollToBottomInstant();
+        });
+        setUnreadCount(0);
+      } else {
+        const added = messages.length - prevLenRef.current;
+        setUnreadCount((prev) => prev + added);
+      }
     }
     prevLenRef.current = messages.length;
   }, [messages.length, scrollToBottomInstant]);
@@ -703,7 +734,12 @@ export default function App() {
       };
 
       isNearBottomRef.current = true;
+      setShowScrollBottom(false);
+      setUnreadCount(0);
       setMessages((prev) => filterValidMessages([...prev, optimisticMsg], now));
+      requestAnimationFrame(() => {
+        scrollToBottomInstant();
+      });
       try {
         broadcastChannelRef.current?.postMessage({
           type: 'message:created',
@@ -770,7 +806,7 @@ export default function App() {
   return (
     <div
       style={viewportStyle}
-      className="fixed inset-x-0 top-0 bottom-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text gpu-accelerated"
+      className="fixed inset-x-0 top-0 bottom-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text gpu-accelerated relative"
     >
       {/* Single Shared Public Message Stream with content-visibility containment */}
       <div
@@ -781,6 +817,40 @@ export default function App() {
         {messages.map((msg) => (
           <MessageRow key={msg.id} msg={msg} onUrlClick={handleUrlClick} />
         ))}
+      </div>
+
+      {/* Floating Quick Scroll to Bottom Button */}
+      <div
+        className={`absolute right-3 sm:right-6 bottom-[66px] sm:bottom-[72px] z-40 transition-all duration-200 ease-out transform ${
+          showScrollBottom
+            ? 'opacity-100 translate-y-0 pointer-events-auto scale-100'
+            : 'opacity-0 translate-y-3 pointer-events-none scale-90'
+        }`}
+      >
+        <button
+          type="button"
+          onClick={scrollToBottomSmooth}
+          aria-label="Scroll to newest messages"
+          className="flex items-center gap-1.5 px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-full bg-zinc-900/95 hover:bg-zinc-800 active:scale-95 border border-zinc-700/80 text-zinc-200 shadow-xl backdrop-blur-md transition-all text-xs font-medium cursor-pointer select-none group"
+        >
+          {unreadCount > 0 ? (
+            <span className="flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-bold bg-sky-500 text-zinc-950 rounded-full animate-pulse">
+              {unreadCount > 99 ? '99+' : unreadCount}
+            </span>
+          ) : null}
+          <span className="text-zinc-300 group-hover:text-white transition-colors">
+            {unreadCount > 0 ? 'New messages' : 'Latest'}
+          </span>
+          <svg
+            className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-zinc-400 group-hover:text-zinc-100 transition-transform group-hover:translate-y-0.5"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2.5}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+          </svg>
+        </button>
       </div>
 
       {/* Minimal Bottom Composer */}
