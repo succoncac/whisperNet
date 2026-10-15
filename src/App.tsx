@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 const TTL_MS = 30 * 60 * 1000;
 const BROADCAST_CHANNEL_NAME = 'ephemeral_public_board_sync_v1';
 
-interface PublicMessage {
+export interface PublicMessage {
   id: string;
   content: string;
   timestamp: number;
@@ -12,19 +12,24 @@ interface PublicMessage {
   pending?: boolean;
 }
 
+// Low-overhead remaining time formatter with zero memory reallocations
 function formatRemainingTtl(msRemaining: number): string {
   if (msRemaining <= 0) return '00:00';
   const totalSeconds = Math.floor(msRemaining / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  const mStr = minutes < 10 ? `0${minutes}` : `${minutes}`;
+  const sStr = seconds < 10 ? `0${seconds}` : `${seconds}`;
+  return `${mStr}:${sStr}`;
 }
 
+// Memory-efficient deduplicator & TTL filter
 function filterValidMessages(list: PublicMessage[], now: number): PublicMessage[] {
   const cutoff = now - TTL_MS;
   const byId = new Map<string, PublicMessage>();
 
-  for (const item of list) {
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
     if (!item || typeof item.id !== 'string' || typeof item.content !== 'string') continue;
     if (item.timestamp < cutoff) continue;
     const existing = byId.get(item.id);
@@ -39,31 +44,103 @@ function filterValidMessages(list: PublicMessage[], now: number): PublicMessage[
   return valid;
 }
 
-interface MessageRowProps {
-  msg: PublicMessage;
-  nowTick: number;
+// High-performance micro-ticker that pauses when page is backgrounded to save CPU and battery on older hardware
+type TickListener = (now: number) => void;
+class MicroTicker {
+  private listeners = new Set<TickListener>();
+  private intervalId: number | null = null;
+
+  subscribe(listener: TickListener) {
+    this.listeners.add(listener);
+    if (this.listeners.size === 1) {
+      this.start();
+    }
+    return () => {
+      this.listeners.delete(listener);
+      if (this.listeners.size === 0) {
+        this.stop();
+      }
+    };
+  }
+
+  private start() {
+    if (this.intervalId !== null || typeof window === 'undefined') return;
+    this.intervalId = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return; // Suspend ticking while phone screen is off or tab is in background
+      }
+      const now = Date.now();
+      this.listeners.forEach((fn) => fn(now));
+    }, 1000);
+  }
+
+  private stop() {
+    if (this.intervalId !== null) {
+      window.clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+  }
+}
+const globalTicker = new MicroTicker();
+
+// Isolated Countdown Badge: Only updates this isolated span every second, preventing the entire message bubble or parent list from re-rendering
+interface CountdownBadgeProps {
+  timestamp: number;
+  pending?: boolean;
 }
 
-const MessageRow = memo(function MessageRow({ msg, nowTick }: MessageRowProps) {
-  const remainingMs = Math.max(0, msg.timestamp + TTL_MS - nowTick);
+const CountdownBadge = memo(function CountdownBadge({ timestamp, pending }: CountdownBadgeProps) {
+  const [displayTtl, setDisplayTtl] = useState<string>(() =>
+    formatRemainingTtl(Math.max(0, timestamp + TTL_MS - Date.now()))
+  );
+
+  useEffect(() => {
+    const updateCountdown = (now: number) => {
+      const remainingMs = Math.max(0, timestamp + TTL_MS - now);
+      const formatted = formatRemainingTtl(remainingMs);
+      setDisplayTtl((prev) => (prev === formatted ? prev : formatted));
+    };
+
+    updateCountdown(Date.now());
+    const unsubscribe = globalTicker.subscribe(updateCountdown);
+    return unsubscribe;
+  }, [timestamp]);
+
   return (
-    <div className="px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-zinc-900/90 border border-zinc-800/80 text-[15px] sm:text-sm text-zinc-100 break-words whitespace-pre-wrap flex items-start justify-between gap-3 transition-opacity duration-150">
-      <div className="min-w-0 flex-1 leading-relaxed break-words select-text">{msg.content}</div>
-      <span
-        className={`text-[11px] font-mono shrink-0 tabular-nums pt-0.5 select-none ${
-          msg.pending ? 'text-zinc-600' : 'text-zinc-500'
-        }`}
-      >
-        {formatRemainingTtl(remainingMs)}
-      </span>
-    </div>
+    <span
+      className={`text-[11px] font-mono shrink-0 tabular-nums pt-0.5 select-none ${
+        pending ? 'text-zinc-600' : 'text-zinc-500'
+      }`}
+    >
+      {displayTtl}
+    </span>
   );
 });
+
+// Memoized Message Row with CSS containment for 60fps scrolling on weak mobile GPUs
+interface MessageRowProps {
+  msg: PublicMessage;
+}
+
+const MessageRow = memo(
+  function MessageRow({ msg }: MessageRowProps) {
+    return (
+      <div className="message-bubble-contain px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-zinc-900/90 border border-zinc-800/80 text-[15px] sm:text-sm text-zinc-100 break-words whitespace-pre-wrap flex items-start justify-between gap-3 transition-opacity duration-150">
+        <div className="min-w-0 flex-1 leading-relaxed break-words select-text">{msg.content}</div>
+        <CountdownBadge timestamp={msg.timestamp} pending={msg.pending} />
+      </div>
+    );
+  },
+  (prev, next) =>
+    prev.msg.id === next.msg.id &&
+    prev.msg.content === next.msg.content &&
+    prev.msg.pending === next.msg.pending &&
+    prev.msg.timestamp === next.msg.timestamp
+);
 
 export default function App() {
   const [messages, setMessages] = useState<PublicMessage[]>([]);
   const [draft, setDraft] = useState<string>('');
-  const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [viewportStyle, setViewportStyle] = useState<React.CSSProperties>({});
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -75,19 +152,13 @@ export default function App() {
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const ackTimeoutsRef = useRef<Map<string, number>>(new Map());
 
-  // Enforce blank title ("ㅤ") and client-side HTTP -> HTTPS upgrade
+  // Throttling references for high-rate scroll and resize events
+  const scrollRafRef = useRef<number | null>(null);
+  const vpRafRef = useRef<number | null>(null);
+
+  // Enforce blank title ("ㅤ")
   useEffect(() => {
     document.title = 'ㅤ';
-    if (typeof window !== 'undefined') {
-      const h = window.location.hostname;
-      const isLocal =
-        h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h.endsWith('.local');
-      if (!isLocal && window.location.protocol === 'http:') {
-        window.location.replace(
-          `https://${window.location.host}${window.location.pathname}${window.location.search}${window.location.hash}`
-        );
-      }
-    }
   }, []);
 
   // Instant scroll to bottom helper (avoids laggy smooth-scroll animation queues on rapid messages)
@@ -97,30 +168,44 @@ export default function App() {
     el.scrollTop = el.scrollHeight;
   }, []);
 
-  // Track whether user is near bottom of the stream
-  const handleScroll = useCallback((el: HTMLDivElement | null) => {
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    isNearBottomRef.current = distanceFromBottom <= 120;
+  // Track scroll position throttled by requestAnimationFrame to prevent scroll jank
+  const handleScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      isNearBottomRef.current = distanceFromBottom <= 120;
+    });
   }, []);
 
-  // Adapt dynamically to mobile browser bottom bars & virtual keyboards (including when entering URL with keyboard already open)
+  // Adapt dynamically to mobile browser bottom bars & virtual keyboards throttled with requestAnimationFrame
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    const updateViewportBounds = () => {
+    const performViewportUpdate = () => {
       if (window.scrollY !== 0 || window.scrollX !== 0) {
         window.scrollTo(0, 0);
       }
 
-      const vv = window.visualViewport;
+      const vv = typeof window !== 'undefined' ? window.visualViewport : null;
       const fallbackHeight =
-        window.innerHeight || document.documentElement?.clientHeight || 600;
+        (typeof window !== 'undefined' ? window.innerHeight : 0) ||
+        (typeof document !== 'undefined' ? document.documentElement?.clientHeight : 0) ||
+        600;
 
-      // Trust visualViewport.height directly when available (do NOT clamp with stale window.innerHeight)
-      const rawHeight = vv && vv.height > 0 ? vv.height : fallbackHeight;
+      const rawHeight =
+        vv && typeof vv.height === 'number' && !isNaN(vv.height) && vv.height > 0
+          ? vv.height
+          : fallbackHeight;
       const safeHeight = Math.max(160, Math.round(rawHeight));
-      const safeTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
+
+      const rawTop =
+        vv && typeof vv.offsetTop === 'number' && !isNaN(vv.offsetTop)
+          ? vv.offsetTop
+          : 0;
+      const safeTop = Math.max(0, Math.round(rawTop));
 
       setViewportStyle((prev) => {
         const nextH = `${safeHeight}px`;
@@ -143,6 +228,14 @@ export default function App() {
       }
     };
 
+    const updateViewportBounds = () => {
+      if (vpRafRef.current !== null) return;
+      vpRafRef.current = requestAnimationFrame(() => {
+        vpRafRef.current = null;
+        performViewportUpdate();
+      });
+    };
+
     updateViewportBounds();
 
     // Multi-stage sync during initial navigation so keyboard dismiss/keep-open transitions after URL bar Enter are always caught
@@ -151,8 +244,8 @@ export default function App() {
 
     const vv = window.visualViewport;
     if (vv) {
-      vv.addEventListener('resize', updateViewportBounds);
-      vv.addEventListener('scroll', updateViewportBounds);
+      vv.addEventListener('resize', updateViewportBounds, { passive: true });
+      vv.addEventListener('scroll', updateViewportBounds, { passive: true });
     }
 
     let resizeObserver: ResizeObserver | null = null;
@@ -161,15 +254,21 @@ export default function App() {
       resizeObserver.observe(document.documentElement);
     }
 
-    window.addEventListener('resize', updateViewportBounds);
-    window.addEventListener('orientationchange', updateViewportBounds);
-    window.addEventListener('pageshow', updateViewportBounds);
-    window.addEventListener('focus', updateViewportBounds);
-    document.addEventListener('focusin', updateViewportBounds);
-    document.addEventListener('focusout', updateViewportBounds);
+    window.addEventListener('resize', updateViewportBounds, { passive: true });
+    window.addEventListener('orientationchange', updateViewportBounds, { passive: true });
+    window.addEventListener('pageshow', updateViewportBounds, { passive: true });
+    window.addEventListener('focus', updateViewportBounds, { passive: true });
+    document.addEventListener('focusin', updateViewportBounds, { passive: true });
+    document.addEventListener('focusout', updateViewportBounds, { passive: true });
 
     return () => {
       timers.forEach((t) => window.clearTimeout(t));
+      if (scrollRafRef.current !== null) {
+        cancelAnimationFrame(scrollRafRef.current);
+      }
+      if (vpRafRef.current !== null) {
+        cancelAnimationFrame(vpRafRef.current);
+      }
       if (vv) {
         vv.removeEventListener('resize', updateViewportBounds);
         vv.removeEventListener('scroll', updateViewportBounds);
@@ -214,7 +313,6 @@ export default function App() {
       const data = await res.json();
       if (data && data.ok && Array.isArray(data.messages)) {
         const now = Date.now();
-        setNowTick(now);
         setMessages((prev) => {
           const pendingOnly = prev.filter(
             (m) => m.pending && !data.messages.some((srv: PublicMessage) => srv.id === m.id)
@@ -264,7 +362,8 @@ export default function App() {
     const queueSnapshot = [...offlineQueueRef.current];
     const remaining: PublicMessage[] = [];
 
-    for (const item of queueSnapshot) {
+    for (let i = 0; i < queueSnapshot.length; i++) {
+      const item = queueSnapshot[i];
       if (Date.now() - item.timestamp >= TTL_MS) continue;
 
       const ws = wsRef.current;
@@ -296,22 +395,35 @@ export default function App() {
   // Multi-tab instant synchronization via BroadcastChannel
   useEffect(() => {
     if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return;
-    const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-    broadcastChannelRef.current = bc;
+    try {
+      const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+      broadcastChannelRef.current = bc;
 
-    bc.onmessage = (event) => {
-      const payload = event.data;
-      if (!payload || typeof payload !== 'object') return;
-      if (payload.type === 'message:created' && payload.message) {
-        const now = Date.now();
-        setMessages((prev) => filterValidMessages([...prev, payload.message], now));
-      }
-    };
+      bc.onmessage = (event) => {
+        try {
+          const payload = event.data;
+          if (!payload || typeof payload !== 'object') return;
+          if (payload.type === 'message:created' && payload.message) {
+            const now = Date.now();
+            setMessages((prev) => filterValidMessages([...prev, payload.message], now));
+          }
+        } catch {
+          // Ignore event parse errors
+        }
+      };
 
-    return () => {
-      bc.close();
+      return () => {
+        try {
+          bc.close();
+        } catch {
+          // Ignore close error
+        }
+        broadcastChannelRef.current = null;
+      };
+    } catch {
+      // In-app browsers or restricted contexts may throw SecurityError
       broadcastChannelRef.current = null;
-    };
+    }
   }, []);
 
   // Real-time WebSocket stream with sub-second fast reconnect & visibility recovery
@@ -338,62 +450,79 @@ export default function App() {
         return;
       }
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
-      ws.onopen = () => {
-        retryAttempt = 0;
-        clearHeartbeat();
-        flushOfflineQueue();
-        heartbeatTimer = window.setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, 15000);
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(String(event.data));
-          const now = Date.now();
-
-          if (
-            (data.type === 'message:created' || data.type === 'message:ack') &&
-            data.message
-          ) {
-            clearAckTimer(data.message.id);
-            const incoming: PublicMessage = { ...data.message, pending: false };
-            setMessages((prev) => filterValidMessages([...prev, incoming], now));
-            broadcastChannelRef.current?.postMessage({
-              type: 'message:created',
-              message: incoming,
-            });
-          } else if (data.type === 'messages:sync' && Array.isArray(data.messages)) {
-            for (const srvMsg of data.messages) {
-              if (srvMsg && srvMsg.id) clearAckTimer(srvMsg.id);
+        ws.onopen = () => {
+          retryAttempt = 0;
+          clearHeartbeat();
+          flushOfflineQueue();
+          heartbeatTimer = window.setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ping' }));
             }
-            setMessages((prev) => {
-              const pendingOnly = prev.filter(
-                (m) => m.pending && !data.messages.some((srv: PublicMessage) => srv.id === m.id)
-              );
-              return filterValidMessages([...data.messages, ...pendingOnly], now);
-            });
-          }
-        } catch {
-          // Ignore malformed WS message
-        }
-      };
+          }, 15000);
+        };
 
-      ws.onclose = () => {
-        clearHeartbeat();
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(String(event.data));
+            const now = Date.now();
+
+            if (
+              (data.type === 'message:created' || data.type === 'message:ack') &&
+              data.message
+            ) {
+              clearAckTimer(data.message.id);
+              const incoming: PublicMessage = { ...data.message, pending: false };
+              setMessages((prev) => filterValidMessages([...prev, incoming], now));
+              try {
+                broadcastChannelRef.current?.postMessage({
+                  type: 'message:created',
+                  message: incoming,
+                });
+              } catch {
+                // Ignore BroadcastChannel errors
+              }
+            } else if (data.type === 'messages:sync' && Array.isArray(data.messages)) {
+              for (let i = 0; i < data.messages.length; i++) {
+                const srvMsg = data.messages[i];
+                if (srvMsg && srvMsg.id) clearAckTimer(srvMsg.id);
+              }
+              setMessages((prev) => {
+                const pendingOnly = prev.filter(
+                  (m) => m.pending && !data.messages.some((srv: PublicMessage) => srv.id === m.id)
+                );
+                return filterValidMessages([...data.messages, ...pendingOnly], now);
+              });
+            }
+          } catch {
+            // Ignore malformed WS message
+          }
+        };
+
+        ws.onclose = () => {
+          clearHeartbeat();
+          if (!isMounted) return;
+          const delay =
+            Math.min(4000, 300 * Math.pow(1.6, retryAttempt)) + Math.floor(Math.random() * 150);
+          retryAttempt += 1;
+          reconnectTimer = window.setTimeout(connectWebSocket, delay);
+        };
+
+        ws.onerror = () => {
+          // Gracefully handled by onclose fallback
+        };
+      } catch {
+        // WebSocket constructor can throw SecurityError in restricted WebViews; fall back safely
         if (!isMounted) return;
-        const delay =
-          Math.min(4000, 300 * Math.pow(1.6, retryAttempt)) + Math.floor(Math.random() * 150);
+        const delay = Math.min(5000, 1000 * Math.pow(1.5, retryAttempt));
         retryAttempt += 1;
         reconnectTimer = window.setTimeout(connectWebSocket, delay);
-      };
+      }
     };
 
     fetchMessages();
@@ -431,27 +560,27 @@ export default function App() {
     };
   }, [clearAckTimer, fetchMessages, flushOfflineQueue]);
 
-  // 1-second ticker to enforce strict 30-minute client-side TTL expiration & countdown updates
+  // Low-frequency TTL expiration cleaner (runs every 10 seconds, zero CPU cost, never re-renders if no message expired)
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      const now = Date.now();
+    const purgeInterval = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const cutoff = Date.now() - TTL_MS;
       setMessages((prev) => {
         if (prev.length === 0) return prev;
-        setNowTick(now);
-        const cutoff = now - TTL_MS;
         const hasExpired = prev.some((m) => m.timestamp < cutoff);
         if (!hasExpired) return prev;
         return prev.filter((m) => m.timestamp >= cutoff);
       });
-    }, 1000);
-    return () => window.clearInterval(interval);
+    }, 10000);
+    return () => window.clearInterval(purgeInterval);
   }, []);
 
-  // Periodic background fallback sync every 15 seconds
+  // Periodic background fallback sync every 20 seconds (pauses when hidden)
   useEffect(() => {
     const syncTimer = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       fetchMessages();
-    }, 15000);
+    }, 20000);
     return () => window.clearInterval(syncTimer);
   }, [fetchMessages]);
 
@@ -483,12 +612,15 @@ export default function App() {
       };
 
       isNearBottomRef.current = true;
-      setNowTick(now);
       setMessages((prev) => filterValidMessages([...prev, optimisticMsg], now));
-      broadcastChannelRef.current?.postMessage({
-        type: 'message:created',
-        message: optimisticMsg,
-      });
+      try {
+        broadcastChannelRef.current?.postMessage({
+          type: 'message:created',
+          message: optimisticMsg,
+        });
+      } catch {
+        // Ignore BroadcastChannel errors in restricted contexts
+      }
 
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -547,16 +679,16 @@ export default function App() {
   return (
     <div
       style={viewportStyle}
-      className="fixed inset-x-0 top-0 bottom-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text"
+      className="fixed inset-x-0 top-0 bottom-0 w-full max-w-full flex flex-col items-center overflow-hidden bg-zinc-950 text-zinc-100 select-text gpu-accelerated"
     >
-      {/* Single Shared Public Message Stream (Responsive across Mobile, Tablet, Desktop, Ultrawide) */}
+      {/* Single Shared Public Message Stream with content-visibility containment */}
       <div
         ref={scrollContainerRef}
-        onScroll={(e) => handleScroll(e.currentTarget)}
-        className="flex-1 min-h-0 w-full max-w-4xl overflow-y-auto overflow-x-hidden touch-scroll px-3 py-3 sm:px-6 sm:py-5 space-y-2"
+        onScroll={handleScroll}
+        className="flex-1 min-h-0 w-full max-w-4xl overflow-y-auto overflow-x-hidden touch-scroll px-3 py-3 sm:px-6 sm:py-5 space-y-2 will-change-scroll"
       >
         {messages.map((msg) => (
-          <MessageRow key={msg.id} msg={msg} nowTick={nowTick} />
+          <MessageRow key={msg.id} msg={msg} />
         ))}
       </div>
 

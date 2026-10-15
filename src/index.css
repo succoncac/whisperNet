@@ -101,3 +101,16 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #334155;
 }
+
+/* Low-end device virtualization & rendering containment with feature detection */
+@supports (content-visibility: auto) {
+  .message-bubble-contain {
+    content-visibility: auto;
+    contain-intrinsic-size: 54px;
+  }
+}
+
+.gpu-accelerated {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
