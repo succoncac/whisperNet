@@ -119,11 +119,16 @@ async function startServer() {
   );
 
   const clients = new Set<WebSocket>();
+  const aliveSockets = new WeakMap<WebSocket, boolean>();
 
   function broadcast(payload: Record<string, unknown>, excludeClient?: WebSocket) {
-    const serialized = JSON.stringify(payload);
+    if (clients.size === 0) return;
+    let serialized: string | null = null;
     for (const client of clients) {
       if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
+        if (serialized === null) {
+          serialized = JSON.stringify(payload);
+        }
         client.send(serialized);
       }
     }
@@ -184,9 +189,37 @@ async function startServer() {
     }
   }, 5000);
 
+  // Dead-socket heartbeat sweeper every 30 seconds to free ghost connections on mobile networks
+  setInterval(() => {
+    for (const ws of clients) {
+      if (aliveSockets.get(ws) === false) {
+        clients.delete(ws);
+        try {
+          ws.terminate();
+        } catch {
+          // Ignore termination error
+        }
+        continue;
+      }
+      aliveSockets.set(ws, false);
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.ping();
+        }
+      } catch {
+        clients.delete(ws);
+      }
+    }
+  }, 30000);
+
   wss.on('connection', (ws: WebSocket) => {
     purgeExpiredMessages();
     clients.add(ws);
+    aliveSockets.set(ws, true);
+
+    ws.on('pong', () => {
+      aliveSockets.set(ws, true);
+    });
 
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(
@@ -199,6 +232,7 @@ async function startServer() {
     }
 
     ws.on('message', (raw) => {
+      aliveSockets.set(ws, true);
       try {
         const data = JSON.parse(String(raw));
         if (data.type === 'ping') {
@@ -297,8 +331,21 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        maxAge: '7d',
+        etag: true,
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
