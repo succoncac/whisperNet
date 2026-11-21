@@ -24,3 +24,5 @@
 - Tải font render-blocking gây chậm hiển thị trên mạng yếu → chuyển sang tải bất đồng bộ với `media="print" onload="this.media='all'"`.
 - Layout thrashing khi gõ ở textarea (`height = 'auto'` mỗi phím) và đối soát `O(N^2)` → chỉ reset `auto` khi thu gọn nội dung, dùng `Set` cho đối soát `O(N)`, và windowing 80 tin nhắn DOM để giữ 60fps trên máy yếu.
 - Khắc phục `-webkit-user-select: text` cho `.select-text` trên trình duyệt di động và bỏ `backdrop-blur`/`animate-pulse` tốn GPU.
+- Khắc phục WebSocket zombie (half-open không báo `close`) bằng ping/pong watchdog 3.5s, `TCP_NODELAY` + `setKeepAlive`, fallback HTTP ngay khi mất kết nối, `upsertMessageFast` `O(1)` không re-sort toàn bộ danh sách, và `useLayoutEffect` cập nhật cuộn 0-frame.
+

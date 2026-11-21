@@ -45,6 +45,56 @@ function filterValidMessages(list: PublicMessage[], now: number): PublicMessage[
   return valid;
 }
 
+// O(1) amortized message upsert/ACK update for instant real-time WebSocket frames
+function upsertMessageFast(
+  prev: PublicMessage[],
+  incoming: PublicMessage,
+  now: number
+): PublicMessage[] {
+  if (!incoming || typeof incoming.id !== 'string' || typeof incoming.content !== 'string') {
+    return prev;
+  }
+  const cutoff = now - TTL_MS;
+  if (incoming.timestamp < cutoff) return prev;
+
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const cur = prev[i];
+    if (cur.id === incoming.id) {
+      if (!cur.pending && incoming.pending) {
+        return prev;
+      }
+      if (
+        cur.pending === incoming.pending &&
+        cur.content === incoming.content &&
+        cur.timestamp === incoming.timestamp
+      ) {
+        return prev;
+      }
+      const prevOk = i === 0 || prev[i - 1].timestamp <= incoming.timestamp;
+      const nextOk = i === prev.length - 1 || incoming.timestamp <= prev[i + 1].timestamp;
+      if (prevOk && nextOk) {
+        const next = prev.slice();
+        next[i] = incoming;
+        return next;
+      }
+      return filterValidMessages([...prev, incoming], now);
+    }
+  }
+
+  if (prev.length === 0 || incoming.timestamp >= prev[prev.length - 1].timestamp) {
+    if (prev.length > 0 && prev[0].timestamp < cutoff) {
+      let firstValid = 0;
+      while (firstValid < prev.length && prev[firstValid].timestamp < cutoff) {
+        firstValid++;
+      }
+      return [...prev.slice(firstValid), incoming];
+    }
+    return [...prev, incoming];
+  }
+
+  return filterValidMessages([...prev, incoming], now);
+}
+
 // O(N) reconciliation helper keeping unconfirmed optimistic messages not yet on server
 function mergeServerMessages(
   prev: PublicMessage[],
@@ -276,6 +326,8 @@ export default function App() {
   const isFlushingRef = useRef<boolean>(false);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const ackTimeoutsRef = useRef<Map<string, number>>(new Map());
+  const pendingAckMsgsRef = useRef<Map<string, PublicMessage>>(new Map());
+  const lastWsActivityRef = useRef<number>(0);
 
   // Performance refs to avoid redundant reflows and O(N^2) queue scans
   const scrollRafRef = useRef<number | null>(null);
@@ -503,6 +555,7 @@ export default function App() {
 
   // Clear pending ACK fallback timer when a message is confirmed
   const clearAckTimer = useCallback((id: string) => {
+    pendingAckMsgsRef.current.delete(id);
     const timer = ackTimeoutsRef.current.get(id);
     if (timer !== undefined) {
       window.clearTimeout(timer);
@@ -539,7 +592,7 @@ export default function App() {
         if (res.ok && data && data.ok && data.message) {
           clearAckTimer(msg.id);
           const confirmed: PublicMessage = { ...data.message, pending: false };
-          setMessages((prev) => filterValidMessages([...prev, confirmed], Date.now()));
+          setMessages((prev) => upsertMessageFast(prev, confirmed, Date.now()));
           try {
             broadcastChannelRef.current?.postMessage({
               type: 'message:created',
@@ -558,6 +611,49 @@ export default function App() {
     [clearAckTimer]
   );
 
+  // Send via active WebSocket with automatic 1.5s ACK fallback to HTTP/offline queue
+  const sendWithWsOrFallback = useCallback(
+    (msg: PublicMessage) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          pendingAckMsgsRef.current.set(msg.id, msg);
+          ws.send(
+            JSON.stringify({
+              type: 'message:send',
+              id: msg.id,
+              content: msg.content,
+            })
+          );
+
+          if (!ackTimeoutsRef.current.has(msg.id)) {
+            const fallbackTimer = window.setTimeout(async () => {
+              ackTimeoutsRef.current.delete(msg.id);
+              pendingAckMsgsRef.current.delete(msg.id);
+              const ok = await postMessageHttp(msg);
+              if (!ok) {
+                enqueueOfflineMessage(msg);
+              }
+            }, 1500);
+            ackTimeoutsRef.current.set(msg.id, fallbackTimer);
+          }
+          return;
+        } catch {
+          pendingAckMsgsRef.current.delete(msg.id);
+          // Fall through to immediate HTTP POST
+        }
+      }
+
+      void (async () => {
+        const ok = await postMessageHttp(msg);
+        if (!ok) {
+          enqueueOfflineMessage(msg);
+        }
+      })();
+    },
+    [enqueueOfflineMessage, postMessageHttp]
+  );
+
   // Flush queued messages automatically on reconnection via active WebSocket or HTTP
   const flushOfflineQueue = useCallback(async () => {
     if (isFlushingRef.current || offlineQueueRef.current.length === 0) return;
@@ -565,6 +661,7 @@ export default function App() {
 
     isFlushingRef.current = true;
     const queueSnapshot = [...offlineQueueRef.current];
+    offlineQueueRef.current = [];
     const remaining: PublicMessage[] = [];
 
     for (let i = 0; i < queueSnapshot.length; i++) {
@@ -574,6 +671,7 @@ export default function App() {
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
+          pendingAckMsgsRef.current.set(item.id, item);
           ws.send(
             JSON.stringify({
               type: 'message:send',
@@ -581,8 +679,20 @@ export default function App() {
               content: item.content,
             })
           );
+          if (!ackTimeoutsRef.current.has(item.id)) {
+            const timer = window.setTimeout(async () => {
+              ackTimeoutsRef.current.delete(item.id);
+              pendingAckMsgsRef.current.delete(item.id);
+              const ok = await postMessageHttp(item);
+              if (!ok) {
+                enqueueOfflineMessage(item);
+              }
+            }, 1500);
+            ackTimeoutsRef.current.set(item.id, timer);
+          }
           continue;
         } catch {
+          pendingAckMsgsRef.current.delete(item.id);
           // Fall through to HTTP fallback
         }
       }
@@ -593,9 +703,11 @@ export default function App() {
       }
     }
 
-    offlineQueueRef.current = remaining;
+    for (let i = 0; i < remaining.length; i++) {
+      enqueueOfflineMessage(remaining[i]);
+    }
     isFlushingRef.current = false;
-  }, [postMessageHttp]);
+  }, [enqueueOfflineMessage, postMessageHttp]);
 
   // Multi-tab instant synchronization via BroadcastChannel
   useEffect(() => {
@@ -610,7 +722,7 @@ export default function App() {
           if (!payload || typeof payload !== 'object') return;
           if (payload.type === 'message:created' && payload.message) {
             const now = Date.now();
-            setMessages((prev) => filterValidMessages([...prev, payload.message], now));
+            setMessages((prev) => upsertMessageFast(prev, payload.message, now));
           }
         } catch {
           // Ignore event parse errors
@@ -630,17 +742,66 @@ export default function App() {
     }
   }, []);
 
-  // Real-time WebSocket stream with sub-second fast reconnect & visibility recovery
+  // Real-time WebSocket stream with zombie-socket pong watchdog, fast reconnect & immediate drop fallback
   useEffect(() => {
     let isMounted = true;
     let reconnectTimer: number | null = null;
     let heartbeatTimer: number | null = null;
+    let pongWatchdogTimer: number | null = null;
     let retryAttempt = 0;
 
+    const clearPongWatchdog = () => {
+      if (pongWatchdogTimer !== null) {
+        window.clearTimeout(pongWatchdogTimer);
+        pongWatchdogTimer = null;
+      }
+    };
+
     const clearHeartbeat = () => {
-      if (heartbeatTimer) {
+      clearPongWatchdog();
+      if (heartbeatTimer !== null) {
         window.clearInterval(heartbeatTimer);
         heartbeatTimer = null;
+      }
+    };
+
+    const flushPendingAckViaHttp = () => {
+      if (pendingAckMsgsRef.current.size === 0) return;
+      const pendingList = Array.from(pendingAckMsgsRef.current.values());
+      for (let i = 0; i < pendingList.length; i++) {
+        const item = pendingList[i];
+        clearAckTimer(item.id);
+        void (async () => {
+          const ok = await postMessageHttp(item);
+          if (!ok) {
+            enqueueOfflineMessage(item);
+          }
+        })();
+      }
+    };
+
+    const sendHeartbeatPing = (ws: WebSocket) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send(JSON.stringify({ type: 'ping' }));
+        clearPongWatchdog();
+        pongWatchdogTimer = window.setTimeout(() => {
+          pongWatchdogTimer = null;
+          // Zombie half-open socket detected: force close to trigger instant reconnect
+          if (wsRef.current === ws) {
+            try {
+              ws.close();
+            } catch {
+              // Ignore close error
+            }
+          }
+        }, 3500);
+      } catch {
+        try {
+          ws.close();
+        } catch {
+          // Ignore
+        }
       }
     };
 
@@ -662,20 +823,25 @@ export default function App() {
 
         ws.onopen = () => {
           retryAttempt = 0;
+          lastWsActivityRef.current = Date.now();
           setIsOffline(false);
           clearHeartbeat();
           flushOfflineQueue();
           heartbeatTimer = window.setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'ping' }));
-            }
+            sendHeartbeatPing(ws);
           }, 15000);
         };
 
         ws.onmessage = (event) => {
+          lastWsActivityRef.current = Date.now();
+          clearPongWatchdog();
           try {
             const data = JSON.parse(String(event.data));
             const now = Date.now();
+
+            if (data.type === 'pong') {
+              return;
+            }
 
             if (
               (data.type === 'message:created' || data.type === 'message:ack') &&
@@ -683,7 +849,7 @@ export default function App() {
             ) {
               clearAckTimer(data.message.id);
               const incoming: PublicMessage = { ...data.message, pending: false };
-              setMessages((prev) => filterValidMessages([...prev, incoming], now));
+              setMessages((prev) => upsertMessageFast(prev, incoming, now));
               setHasLoadedOnce(true);
               try {
                 broadcastChannelRef.current?.postMessage({
@@ -708,9 +874,13 @@ export default function App() {
 
         ws.onclose = () => {
           clearHeartbeat();
+          if (wsRef.current === ws) {
+            wsRef.current = null;
+          }
+          flushPendingAckViaHttp();
           if (!isMounted) return;
           const delay =
-            Math.min(4000, 300 * Math.pow(1.6, retryAttempt)) + Math.floor(Math.random() * 150);
+            Math.min(4000, 150 * Math.pow(1.7, retryAttempt)) + Math.floor(Math.random() * 100);
           retryAttempt += 1;
           reconnectTimer = window.setTimeout(connectWebSocket, delay);
         };
@@ -720,7 +890,7 @@ export default function App() {
         };
       } catch {
         if (!isMounted) return;
-        const delay = Math.min(5000, 1000 * Math.pow(1.5, retryAttempt));
+        const delay = Math.min(5000, 800 * Math.pow(1.5, retryAttempt));
         retryAttempt += 1;
         reconnectTimer = window.setTimeout(connectWebSocket, delay);
       }
@@ -731,8 +901,11 @@ export default function App() {
 
     const onOnline = () => {
       setIsOffline(false);
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
         connectWebSocket();
+      } else {
+        sendHeartbeatPing(ws);
       }
       fetchMessages();
       flushOfflineQueue();
@@ -744,10 +917,14 @@ export default function App() {
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
           connectWebSocket();
+          fetchMessages();
+        } else if (Date.now() - lastWsActivityRef.current > 20000) {
+          sendHeartbeatPing(ws);
+          fetchMessages();
         }
-        fetchMessages();
       }
     };
 
@@ -766,7 +943,7 @@ export default function App() {
         wsRef.current.close();
       }
     };
-  }, [clearAckTimer, fetchMessages, flushOfflineQueue]);
+  }, [clearAckTimer, enqueueOfflineMessage, fetchMessages, flushOfflineQueue, postMessageHttp]);
 
   // Low-frequency TTL expiration cleaner (runs every 10s, skips when hidden or empty)
   useEffect(() => {
@@ -789,31 +966,41 @@ export default function App() {
     return () => window.clearInterval(purgeInterval);
   }, []);
 
-  // Periodic background fallback sync every 20 seconds (pauses when hidden)
+  // Periodic HTTP fallback sync every 20s ONLY when WebSocket is unhealthy/disconnected
   useEffect(() => {
     const syncTimer = window.setInterval(() => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      fetchMessages();
+      const ws = wsRef.current;
+      const wsHealthy =
+        ws && ws.readyState === WebSocket.OPEN && Date.now() - lastWsActivityRef.current < 35000;
+      if (!wsHealthy) {
+        fetchMessages();
+      }
     }, 20000);
     return () => window.clearInterval(syncTimer);
   }, [fetchMessages]);
 
-  // Auto-scroll when new messages arrive or track unread count when scrolled up
+  // 0-frame instant auto-scroll via useLayoutEffect when a new latest message arrives
   const prevLenRef = useRef<number>(0);
-  useEffect(() => {
-    if (messages.length > prevLenRef.current) {
+  const prevLastMsgIdRef = useRef<string | null>(null);
+  const lastMsgId = messages.length > 0 ? messages[messages.length - 1].id : null;
+  useLayoutEffect(() => {
+    const hasNewTail = lastMsgId !== null && lastMsgId !== prevLastMsgIdRef.current;
+    const grew = messages.length > prevLenRef.current;
+    if (hasNewTail || grew) {
       if (isNearBottomRef.current) {
-        requestAnimationFrame(() => {
-          scrollToBottomInstant();
-        });
+        scrollToBottomInstant();
         setUnreadCount(0);
-      } else {
+      } else if (grew) {
         const added = messages.length - prevLenRef.current;
         setUnreadCount((prev) => prev + added);
+      } else if (hasNewTail) {
+        setUnreadCount((prev) => prev + 1);
       }
     }
     prevLenRef.current = messages.length;
-  }, [messages.length, scrollToBottomInstant]);
+    prevLastMsgIdRef.current = lastMsgId;
+  }, [lastMsgId, messages.length, scrollToBottomInstant]);
 
   // Zero-Latency Non-Blocking Message Dispatch (WebSocket-First with HTTP fallback)
   const dispatchMessage = useCallback(
@@ -834,10 +1021,7 @@ export default function App() {
       isNearBottomRef.current = true;
       setShowScrollBottom(false);
       setUnreadCount(0);
-      setMessages((prev) => filterValidMessages([...prev, optimisticMsg], now));
-      requestAnimationFrame(() => {
-        scrollToBottomInstant();
-      });
+      setMessages((prev) => upsertMessageFast(prev, optimisticMsg, now));
 
       try {
         broadcastChannelRef.current?.postMessage({
@@ -848,39 +1032,9 @@ export default function App() {
         // Ignore BroadcastChannel errors
       }
 
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(
-            JSON.stringify({
-              type: 'message:send',
-              id: msgId,
-              content: text,
-            })
-          );
-
-          const fallbackTimer = window.setTimeout(async () => {
-            ackTimeoutsRef.current.delete(msgId);
-            const ok = await postMessageHttp(optimisticMsg);
-            if (!ok) {
-              enqueueOfflineMessage(optimisticMsg);
-            }
-          }, 1500);
-          ackTimeoutsRef.current.set(msgId, fallbackTimer);
-          return;
-        } catch {
-          // Fall through to HTTP POST
-        }
-      }
-
-      void (async () => {
-        const ok = await postMessageHttp(optimisticMsg);
-        if (!ok) {
-          enqueueOfflineMessage(optimisticMsg);
-        }
-      })();
+      sendWithWsOrFallback(optimisticMsg);
     },
-    [enqueueOfflineMessage, postMessageHttp, scrollToBottomInstant]
+    [sendWithWsOrFallback]
   );
 
   const submitCurrentDraft = useCallback(() => {

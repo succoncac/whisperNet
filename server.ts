@@ -212,7 +212,8 @@ async function startServer() {
     }
   }, 30000);
 
-  wss.on('connection', (ws: WebSocket) => {
+  wss.on('connection', (ws: WebSocket, req) => {
+    req.socket?.setNoDelay?.(true);
     purgeExpiredMessages();
     clients.add(ws);
     aliveSockets.set(ws, true);
