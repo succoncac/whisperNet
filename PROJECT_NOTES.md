@@ -14,6 +14,7 @@
 - `src/index.css`: Tailwind v4, cấu hình cuộn mượt cảm ứng, `content-visibility: auto`, hỗ trợ `select-text` trên iOS/Android, `touch-action: manipulation`, và `prefers-reduced-motion`.
 - `src/App.tsx`: Giao diện chính gồm luồng tin nhắn công khai (progressive windowing 80 tin/lần), `MicroTicker` 1Hz tạm dừng khi ẩn tab, nhận diện link và modal cảnh báo chuyển hướng 100% tiếng Anh, nút trượt nhanh xuống mới nhất, hàng đợi gửi lại khi mất mạng, đồng bộ đa tab qua `BroadcastChannel`.
 - `server.ts`: HTTP/WebSocket server (`TCP_NODELAY`, `perMessageDeflate: false`), tự dọn tin hết hạn mỗi 5s, heartbeat `ping/pong` dọn socket chết mỗi 30s, cache header cho static assets production.
+- `README.md`: Tài liệu hướng dẫn open-source (tính năng, cài đặt, biến môi trường, API/WebSocket, cấu trúc).
 
 ## Quy ước & Ràng buộc
 - Giữ giao diện tối giản cao cấp nền tối hiện tại, chỉ là ứng dụng nhắn tin ẩn danh thuần túy (không thêm tính năng thừa như nickname, phòng chat phức tạp, thanh trạng thái rườm rà).
